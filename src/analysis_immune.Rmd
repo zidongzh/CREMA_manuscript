@@ -1,0 +1,648 @@
+---
+title: Analysis of CREMA circuitry of the immune cells
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+
+```{r}
+library(Seurat)
+library(Signac) 
+
+library(Matrix)
+library(matrixStats)
+
+library(igraph)
+
+library(monocle3)
+library(cicero)
+
+library(TFBSTools)
+library(motifmatchr)
+
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+
+
+library(data.table)
+
+library(parallel)
+
+library(PRROC)
+
+library(rtracklayer)
+library(liftOver)
+```
+
+```{r}
+devtools::load_all("../CREMA")
+```
+
+# Data
+
+```{r}
+dataset_name <- "multiome"
+
+data_multi <- readRDS(file.path("../data_seurat_object/10X_pbmc", paste0(dataset_name, ".rds")))
+
+frag_object_inserts <- CreateFragmentObject(path = file.path("/Genomics/Users/zidongz/crema/data/10X_pbmc", dataset_name,
+                                                                          "pbmc_granulocyte_sorted_10k_atac_inserts.tsv.gz"), 
+                                                         cells = colnames(data_multi))
+```
+
+```{r}
+# gene annotation
+print("using gene annotation from EnsDb.Hsapiens.v86")
+
+genebody_coords <- keepStandardChromosomes(ensembldb::genes(EnsDb.Hsapiens.v86), 
+                                           species = "Homo_sapiens", pruning.mode = 'coarse')
+
+# change style of seqnames
+# This may not work because UCSC recently changed their format. Should be fixed in the latest Bioconductor. But if not, use the following workaround, which should at least work for the main chromosomes
+# seqlevelsStyle(genebody_coords) <- 'UCSC'
+# # work around:
+seqlevels(genebody_coords) <- paste0("chr", seqlevels(genebody_coords))
+```
+
+```{r}
+# For gene symbols that have more than one occurrences in the annotation, select the one with "protein_coding"
+genebody_coords <- genebody_coords[sapply(genebody_coords$gene_name, nchar) > 0]
+temp_ind <- table(genebody_coords$gene_name)
+temp_ind <- names(temp_ind)[temp_ind > 1]
+
+genebody_coords_list <- split(genebody_coords, f = genebody_coords$gene_name)
+temp_func <- function(x){
+    if ("protein_coding" %in% x$gene_biotype){ return(x[x$gene_biotype == "protein_coding"])
+    }else{ return(x) }
+}
+genebody_coords_list <- c(lapply(genebody_coords_list[temp_ind], temp_func),
+                          as.list(genebody_coords_list[setdiff(names(genebody_coords_list), temp_ind)]))
+
+genebody_coords <- unlist(as(genebody_coords_list, "GRangesList"))
+genebody_coords <- sort(genebody_coords)
+```
+
+```{r}
+motif_database <- "jaspar"
+motifs <- readRDS(file.path("../CREMA/crema_resource/tf_motifs/data_rds", paste0("motifs_pwmlist_human_", motif_database, ".rds")))
+
+# motifs are named as "TF_MotifID"
+motif_tfs <- unique(sapply(strsplit(names(motifs), split = "_"), function(x){x[1]}))
+```
+
+## Select genes
+
+```{r}
+# filter for genes above a 
+exp_mtx <- GetAssayData(data_multi, assay = "RNA", slot = "counts")
+exp_mtx <- filter_exp_mtx_genes(exp_mtx, gene_names_remove_pattern = "^MT-", proportion_cells_detected = 1e-3)
+
+# Select TFs included in the model
+TFs_select <- intersect(motif_tfs, row.names(exp_mtx))
+
+# Select target genes
+genes_select <- row.names(exp_mtx)
+
+# Filter for genes with annotated TSS and not in chrM
+chromosomes <- paste0("chr", c(seq(1,22), "X", "Y"))
+genes_select <- genes_select[genes_select %in% genebody_coords$symbol[as.character(seqnames(genebody_coords)) %in% chromosomes]]
+
+
+print(paste("num of TFs selected:", length(TFs_select)))
+print(paste("num of genes selected:", length(genes_select)))
+```
+
+## RNA matrix
+
+We use the `counts` matrix from the `SCT` assay (after running `SCTransform` on the data) as the data matrix for RNA levels in the CREMA model. Before obtaining the 
+
+```{r}
+exp_mtx <- GetAssayData(data_multi, assay = "SCT", slot = "counts")
+
+# there might be a few gene names that are dropped by SCTransform
+TFs_select <- intersect(TFs_select, row.names(exp_mtx))
+genes_select <- intersect(genes_select, row.names(exp_mtx))
+
+exp_mtx <- as.matrix(exp_mtx[union(TFs_select, genes_select), ])
+```
+
+## CREMA regions
+
+```{r}
+crema_regions <- select_proximal_regions(genes = genes_select, 
+                                         gene_body_gr = genebody_coords, 
+                                         window_up = 100000, window_down = 100000)
+
+# transform the GRanges objects into strings
+crema_regions_str <- lapply(crema_regions, Signac::GRangesToString)
+```
+
+## CREMA results
+
+```{r}
+# All sites -----
+site_extension <- 200
+regression_method <- "ols"
+
+smooth_k <- 0
+smooth_name <- ifelse(smooth_k == 0, yes = "", no = paste0("smooth-", smooth_k, "_"))
+
+output_dir <- file.path("../linear_model_results/", paste0("10X_pbmc-proximal", "-site", site_extension, "_", motif_database))
+lm.models_tf_ATACweighted_highres <- readRDS(file.path(output_dir,
+                                                       paste0("crema-", regression_method, "-", "SCTcounts",
+                                                              "_allTFs-allGenes-ATACweighted-highres_",
+                                                              smooth_name,
+                                                              dataset_name, ".rds")))
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[sapply(lm.models_tf_ATACweighted_highres, length) > 1]
+
+temp_p <- unlist(lapply(lm.models_tf_ATACweighted_highres, function(x){x$p}))
+p_val_cutoff <- max(temp_p[p.adjust(temp_p, method = "fdr") < 1e-4])
+
+
+# Data frame of gene - tf - site =====
+temp_func <- function(x){
+    tf_site_p <- lm.models_tf_ATACweighted_highres[[x]]$p
+    tf_site_t <- lm.models_tf_ATACweighted_highres[[x]]$t
+    temp_ind <- tf_site_p < p_val_cutoff
+    
+    if (sum(temp_ind) == 0) { return(data.frame()) }
+    return(data.frame(gene = x,
+                      site = names(tf_site_p)[temp_ind],
+                      p_val = tf_site_p[temp_ind],
+                      t = tf_site_t[temp_ind]))
+}
+crema_gene_tf_site_df_all <- mclapply(names(lm.models_tf_ATACweighted_highres), temp_func, mc.cores = 60)
+crema_gene_tf_site_df_all <- do.call("rbind", crema_gene_tf_site_df_all)
+
+
+temp <- strsplit(crema_gene_tf_site_df_all$site, split = "_")
+crema_gene_tf_site_df_all$TF <- sapply(temp, function(x){x[1]})
+crema_gene_tf_site_df_all$site <- sapply(temp, function(x){x[2]})
+```
+
+
+```{r}
+# Remove duplicating entries
+crema_by_tf_list <- split(crema_gene_tf_site_df_all, crema_gene_tf_site_df_all$TF)
+
+temp_func <- function(temp_df){
+    temp_sites_str <- unique(temp_df$site)
+    temp_sites_gr <- StringToGRanges(temp_sites_str)
+    temp_sites_reduce <- reduce(temp_sites_gr)
+    
+    temp_sites_reduce <- unlist(tile(temp_sites_reduce, width = 50), recursive = T)
+    
+    temp_overlap <- findOverlaps(temp_sites_gr, temp_sites_reduce, minoverlap = floor(min(width(temp_sites_gr))/2))
+    temp_overlap_df <- data.frame(site = temp_sites_str[temp_overlap@from],
+                                  site_reduce = GRangesToString(temp_sites_reduce)[temp_overlap@to])
+    
+    temp_df <- merge(temp_df, temp_overlap_df, by = "site", all.x = T)
+    return(temp_df)
+}
+crema_by_tf_list <- mclapply(crema_by_tf_list, temp_func, mc.cores = 48)
+
+crema_gene_tf_site_reduced_df <- do.call("rbind", crema_by_tf_list)
+crema_gene_tf_site_reduced_df$site <- crema_gene_tf_site_reduced_df$site_reduce
+crema_gene_tf_site_reduced_df$site_reduce <- NULL
+
+crema_gene_tf_site_reduced_df <- data.table(crema_gene_tf_site_reduced_df)
+
+crema_gene_tf_site_reduced_df <- crema_gene_tf_site_reduced_df[ , list(p_val = min(p_val), t = max(t)), by = list(TF, site, gene)]
+```
+
+```{r}
+crema_gene_tf_site_select_df <- crema_gene_tf_site_reduced_df
+crema_gene_tf_site_select_df$id <- paste0(crema_gene_tf_site_select_df$TF, "_", crema_gene_tf_site_select_df$site, "_", crema_gene_tf_site_select_df$gene)
+crema_gene_tf_site_select_df <- crema_gene_tf_site_select_df[!duplicated(crema_gene_tf_site_select_df$id), ]
+```
+
+```{r}
+# Add peak informtion -----
+min_overlap_for_peak <- 0
+
+sites_all_str <- unique(crema_gene_tf_site_select_df$site)
+sites_all_gr <- StringToGRanges(sites_all_str)
+
+peaks_all_gr <- data_multi[["ATAC"]]@ranges
+peaks_all_str <- GRangesToString(peaks_all_gr)
+
+temp_overlap <- findOverlaps(sites_all_gr, peaks_all_gr, minoverlap = min_overlap_for_peak)
+temp_overlap_df <- data.frame(site = sites_all_str[temp_overlap@from],
+                              overlapped_peak = peaks_all_str[temp_overlap@to])
+
+crema_gene_tf_site_select_df <- merge(crema_gene_tf_site_select_df, temp_overlap_df, by = "site", all.x = T, sort = F)
+crema_gene_tf_site_select_df$inpeak <- !is.na(crema_gene_tf_site_select_df$overlapped_peak)
+```
+
+```{r}
+print(table(crema_gene_tf_site_select_df$t > 0))
+```
+
+
+# Circuitry Analysis
+
+## Circuits Activity
+
+```{r}
+# print(length(sites_all_gr))
+# 
+# sites_select <- Extend(sites_all_gr, upstream = site_extension, downstream = site_extension)
+# sites_select_list <- list()
+# batchSize <- 20000
+# for (i in seq(1, ceiling(length(sites_select)/batchSize))){
+#     sites_select_list[[i]] <- sites_select[(batchSize*(i-1)+1) : min(batchSize*i, length(sites_select))]
+# }
+# sites_access_mtx_list <- mclapply(sites_select_list,
+#                                   function(x){FeatureMatrix(fragments = frag_object_inserts,
+#                                                             features = x,
+#                                                             cells = colnames(data_multi),
+#                                                             process_n = 2000000,
+#                                                             verbose = F)},
+#                                   mc.cores = length(sites_select_list))
+# sites_access_mtx <- do.call("rbind", sites_access_mtx_list)
+# row.names(sites_access_mtx) <- sites_all_str
+# 
+# # sites_select <- Extend(sites_all_gr, upstream = site_extension, downstream = site_extension)
+# # sites_access_mtx <- FeatureMatrix(fragments = frag_object_inserts,
+# #                                   features = sites_select,
+# #                                   cells = colnames(data_multi),
+# #                                   process_n = 2000000)
+# # row.names(sites_access_mtx) <- sites_all_str
+# 
+# saveRDS(sites_access_mtx, "../application/10X_pbmc/site_access_mtx_reduce.rds")
+```
+
+```{r}
+# # sites_access_mtx <- readRDS("../application/10X_pbmc/site_access_mtx.rds")
+# 
+# sites_access_mtx <- as.matrix((sites_access_mtx > 0) + 0)
+# 
+# circuit_activity_mtx <- exp_mtx[crema_gene_tf_site_select_df$TF, ] *
+#     sites_access_mtx[crema_gene_tf_site_select_df$site, ] *
+#     exp_mtx[crema_gene_tf_site_select_df$gene, ]
+# 
+# row.names(circuit_activity_mtx) <- crema_gene_tf_site_select_df$id
+# saveRDS(circuit_activity_mtx, "../application/10X_pbmc/circuit_activity_mtx_reduce.rds")
+```
+
+```{r}
+sites_access_mtx <- readRDS("../application/10X_pbmc/site_access_mtx_reduce.rds")
+circuit_activity_mtx <- readRDS("../application/10X_pbmc/circuit_activity_mtx_reduce.rds")
+```
+
+## Cell type
+
+```{r}
+# Clear cell type names ==========
+
+print(table(data_multi$predicted.id))
+celltypes_remove <- c("ASDC", "Eryth", "ILC", "Plasmablast", "Platelet")
+# celltypes_remove <- names(table(data_multi$predicted.id))[table(data_multi$predicted.id) < 20]
+
+data_multi_new <- subset(data_multi, cells = colnames(data_multi)[!(data_multi$predicted.id %in% celltypes_remove)])
+
+
+# Fine resolution cell type annotation -----
+data_multi_new$celltype_annotation_fine <- data_multi_new$predicted.id
+
+
+# Coarse resolution cell type annotation -----
+celltype_mapping <-  list(
+"CD4 Naive" = "Naive T",
+"CD8 Naive" = "Naive T",
+"CD4 TCM" = "Central memory T",
+"CD8 TCM" = "Central memory T",
+"CD4 TEM" = "Effector memory T",
+"CD8 TEM" = "Effector memory T",
+"CD4 Proliferating" = "Proliferating T",
+"CD8 Proliferating" = "Proliferating T",
+"cDC1" = "cDC",
+"cDC2" = "cDC",
+"pDC" = "pDC",
+"NK" = "NK",
+"NK Proliferating" = "NK",
+"NK_CD56bright" = "NK",
+"CD14 Mono" = "Mono",
+"CD16 Mono" = "Mono"
+)
+celltype_mapping <- unlist(celltype_mapping)
+
+data_multi_new$celltype_annotation <- as.character(data_multi_new$celltype_annotation_fine)
+temp_ind <- data_multi_new$celltype_annotation %in% names(celltype_mapping)
+data_multi_new$celltype_annotation[temp_ind] <- celltype_mapping[data_multi_new$celltype_annotation[temp_ind]]
+
+
+# list mapping coarse cell types to fine cell types -----
+temp_celltypes_remaining <- setdiff(as.character(data_multi_new$celltype_annotation_fine), names(celltype_mapping))
+
+celltype_resolution_list <- rbind(stack(celltype_mapping),
+                                  data.frame(values = temp_celltypes_remaining, ind = temp_celltypes_remaining))
+celltype_resolution_list <- split(x = as.character(celltype_resolution_list$ind), f = celltype_resolution_list$values)
+
+
+print(table(data_multi_new$celltype_annotation))
+print(table(data_multi_new$celltype_annotation_fine))
+```
+
+```{r}
+celltypes_select <- names(table(data_multi_new$celltype_annotation))[table(data_multi_new$celltype_annotation) > 20]
+
+celltype_resolution_list <- celltype_resolution_list[celltypes_select]
+celltype_cell_coarse_list <- split(x = colnames(data_multi_new), f = data_multi_new$celltype_annotation)[names(celltype_resolution_list)]
+celltype_cell_fine_list <- split(x = colnames(data_multi_new), f = data_multi_new$celltype_annotation_fine)[unlist(celltype_resolution_list)]
+
+print(sapply(celltype_cell_coarse_list, length))
+print(sapply(celltype_cell_fine_list, length))
+
+celltypes_order_plot <- c("Naive T", "Central memory T", "Effector memory T", "NK", 
+                          "B naive", "B intermediate", "B memory", 
+                          "Mono")
+
+print(table(data_multi_new$celltype_annotation)[celltypes_order_plot])
+```
+
+```{r}
+aggregate_fine_to_coarse <- function(x){
+    temp_rownames <- row.names(x)
+    x <- do.call("cbind", lapply(celltype_resolution_list, function(y){matrix(rowMaxs(x[,y,drop = F]), ncol = 1)}))
+    row.names(x) <- temp_rownames
+    colnames(x) <- names(celltype_resolution_list)
+    return(x)
+}
+```
+
+## Circuit by Celltype
+
+```{r}
+# circuit_Mean_mtx_by_celltype <- do.call("cbind", 
+#                                           lapply(celltype_cell_coarse_list, 
+#                                                  function(x){matrix(rowMeans(circuit_activity_mtx[, x, drop = F]), nrow = nrow(circuit_activity_mtx), ncol = 1)}))
+# colnames(circuit_Mean_mtx_by_celltype) <- names(celltype_cell_coarse_list)
+# row.names(circuit_Mean_mtx_by_celltype) <- row.names(circuit_activity_mtx)
+# 
+# circuit_binary_mtx_by_celltype <- circuit_posRatio_mtx_by_celltype > 0.1 & circuit_posNum_mtx_by_celltype > 50
+# print(colSums(circuit_binary_mtx_by_celltype)[celltypes_order_plot])
+```
+
+```{r}
+# Circuit activity by cell type - binary ----------
+# circuit_posNum_mtx_by_celltype <- do.call("cbind", 
+#                                           lapply(celltype_cell_fine_list, 
+#                                                  function(x){matrix(rowSums(circuit_activity_mtx[, x, drop = F] > 0), nrow = nrow(circuit_activity_mtx), ncol = 1)}))
+# colnames(circuit_posNum_mtx_by_celltype) <- names(celltype_cell_fine_list)
+# row.names(circuit_posNum_mtx_by_celltype) <- row.names(circuit_activity_mtx)
+# 
+# circuit_posRatio_mtx_by_celltype <- t(t(circuit_posNum_mtx_by_celltype) / sapply(celltype_cell_fine_list, length))
+
+circuit_posNum_mtx_by_celltype <- do.call("cbind", 
+                                          lapply(celltype_cell_coarse_list, 
+                                                 function(x){matrix(rowSums(circuit_activity_mtx[, x, drop = F] > 0), nrow = nrow(circuit_activity_mtx), ncol = 1)}))
+colnames(circuit_posNum_mtx_by_celltype) <- names(celltype_cell_coarse_list)
+row.names(circuit_posNum_mtx_by_celltype) <- row.names(circuit_activity_mtx)
+
+circuit_posRatio_mtx_by_celltype <- t(t(circuit_posNum_mtx_by_celltype) / sapply(celltype_cell_coarse_list, length))
+
+
+hist(circuit_posNum_mtx_by_celltype, breaks = 30, main = "Number of cells expression a circuit in a cell type")
+hist(circuit_posRatio_mtx_by_celltype, breaks = 30, main = "Ratio of cells expression a circuit in a cell type")
+
+print(colSums(circuit_posNum_mtx_by_celltype > 100)[celltypes_order_plot])
+print(colSums(circuit_posRatio_mtx_by_celltype > 0.1)[celltypes_order_plot])
+
+# circuit_binary_mtx_by_celltype <- circuit_posRatio_mtx_by_celltype > 0.001
+# circuit_binary_mtx_by_celltype <- circuit_posRatio_mtx_by_celltype > 0.1 | circuit_posNum_mtx_by_celltype > 100
+circuit_binary_mtx_by_celltype <- circuit_posRatio_mtx_by_celltype > 0.1 & circuit_posNum_mtx_by_celltype > 50
+print(colSums(circuit_binary_mtx_by_celltype)[celltypes_order_plot])
+```
+
+```{r}
+# # Circuit activity by cell type - cosine similarity ----------
+# 
+# circuit_activity_binary_mtx <- circuit_activity_mtx[, colnames(data_multi_new)] > 0
+# circuit_activity_binary_mtx <- circuit_activity_binary_mtx[rowSums(circuit_activity_binary_mtx) > 0, ]
+# 
+# # celltype_index_mtx <- matrix(0, nrow = ncol(data_multi_new), ncol = length(celltype_cell_fine_list), 
+# #                              dimnames = list(colnames(data_multi_new), names(celltype_cell_fine_list)))
+# # for (x in names(celltype_cell_fine_list)){ celltype_index_mtx[celltype_cell_fine_list[[x]], x] <- 1 }
+# celltype_index_mtx <- matrix(0, nrow = ncol(data_multi_new), ncol = length(celltype_cell_coarse_list), 
+#                              dimnames = list(colnames(data_multi_new), names(celltype_cell_coarse_list)))
+# for (x in names(celltype_cell_coarse_list)){ celltype_index_mtx[celltype_cell_coarse_list[[x]], x] <- 1 }
+# 
+# # cosine similarity
+# circuit_cos_mtx_by_celltype <- circuit_activity_binary_mtx %*% celltype_index_mtx / 
+#     sqrt(matrix(rowSums(circuit_activity_binary_mtx), ncol = 1) %*% matrix(colSums(celltype_index_mtx), nrow = 1))
+# 
+# circuit_cos_mtx_by_celltype <- as.matrix(circuit_cos_mtx_by_celltype)
+# hist(circuit_cos_mtx_by_celltype[,1])
+# 
+# # # aggregate to coarse cell type
+# # circuit_cos_mtx_by_celltype <- aggregate_fine_to_coarse(circuit_cos_mtx_by_celltype)
+# 
+# print(colSums(circuit_cos_mtx_by_celltype > 0.05))
+```
+
+
+
+
+## Module Activity
+
+```{r}
+# modules of TF - circuits =====
+modules_circuit_list <- split(x = crema_gene_tf_site_select_df$id, f = crema_gene_tf_site_select_df$TF)
+
+modules_target_list <- split(x = crema_gene_tf_site_select_df$gene, f = crema_gene_tf_site_select_df$TF)
+modules_target_list <- lapply(modules_target_list[names(modules_circuit_list)], unique)
+
+modules_df <- data.frame(TF = names(modules_circuit_list), 
+                         num_circuits = sapply(modules_circuit_list, length),
+                         num_targets = sapply(modules_target_list, length))
+
+hist(modules_df$num_circuits, breaks = 50)
+hist(modules_df$num_targets, breaks = 50)
+```
+
+```{r}
+# Use sum of score and normal distribution to calculate p value
+sum_zscore_activity_func <- function(circuit_activity_mtx, modules_circuit_list){
+    
+    temp_all_circuits <- row.names(circuit_activity_mtx)
+    modules_circuit_list <- lapply(modules_circuit_list, function(x){intersect(x, temp_all_circuits)})
+    
+    celltype_mean <- colMeans(circuit_activity_mtx)
+    celltype_std <- colSds(circuit_activity_mtx)
+    
+    modules_size <- sapply(modules_circuit_list, length)
+    
+    # Sample mean by module
+    circuit_activity_mean <- do.call("rbind",
+                                    lapply(modules_circuit_list, function(x){matrix(colMeans(circuit_activity_mtx[x,,drop=F]), nrow = 1)}))
+    colnames(circuit_activity_mean) <- colnames(circuit_activity_mtx)
+    row.names(circuit_activity_mean) <- names(modules_circuit_list)
+    
+    # z score
+    circuit_activity_z <- t((t(circuit_activity_mean) - celltype_mean) / celltype_std) * sqrt(modules_size)
+    
+    return(circuit_activity_z)
+}
+```
+
+
+```{r}
+circuit_binary_mtx_by_celltype <- circuit_binary_mtx_by_celltype
+circuit_continuous_mtx_by_celltype <- circuit_posRatio_mtx_by_celltype
+
+
+# Number of circuits -----
+modules_activityNum_celltype_mtx <- do.call("rbind", 
+                                            lapply(modules_circuit_list,
+                                                   function(x){matrix(colSums(circuit_binary_mtx_by_celltype[x, , drop = F]), nrow = 1)}))
+row.names(modules_activityNum_celltype_mtx) <- names(modules_circuit_list)
+colnames(modules_activityNum_celltype_mtx) <- colnames(circuit_binary_mtx_by_celltype)
+
+
+# Module activity by z score -----
+modules_activityZ_celltype_mtx <- sum_zscore_activity_func(circuit_activity_mtx = circuit_continuous_mtx_by_celltype,
+                                                           modules_circuit_list = modules_circuit_list)
+hist(modules_activityZ_celltype_mtx)
+modules_activityZP_celltype_mtx <- pnorm(modules_activityZ_celltype_mtx, lower.tail = F)
+
+
+# Dot plot -----
+
+modules_plot_num_cutoff <- sapply(celltypes_order_plot, 
+                                  function(x){row.names(modules_activityNum_celltype_mtx)[modules_activityNum_celltype_mtx[, x] >= 20]}, 
+                                  USE.NAMES = T, simplify = F)
+modules_plot_num_cutoff <- sapply(celltypes_order_plot, 
+                                  function(x){modules_plot_num_cutoff[[x]][modules_activityZP_celltype_mtx[modules_plot_num_cutoff[[x]], x] <= 1e-10]}, 
+                                  USE.NAMES = T, simplify = F)
+
+temp_mtx <- modules_activityZ_celltype_mtx[, celltypes_order_plot]
+temp_mtx <- temp_mtx / rowSums(temp_mtx)
+modules_plot <- sapply(names(modules_plot_num_cutoff), 
+                       function(x){modules_plot_num_cutoff[[x]][order(temp_mtx[modules_plot_num_cutoff[[x]],x], decreasing = T)[1:min(3,length(modules_plot_num_cutoff[[x]]))]]}, 
+                       USE.NAMES = T, simplify = F)
+modules_plot <- unique(unlist(modules_plot))
+
+
+# remove modules that are on across many cell types
+modules_plot <- setdiff(modules_plot, c("ELF1", "IKZF1", "KLF2"))
+
+
+temp_df <- as.data.frame(modules_activityZP_celltype_mtx[modules_plot, celltypes_order_plot])
+temp_df$module <- row.names(temp_df)
+temp_df <- reshape2::melt(temp_df, id.vars = c("module"), variable.name = "celltype", value.name = "P value")
+
+temp_num_df <- as.data.frame(modules_activityNum_celltype_mtx[modules_plot, celltypes_order_plot])
+temp_num_df$module <- row.names(temp_num_df)
+temp_num_df <- reshape2::melt(temp_num_df, id.vars = c("module"), variable.name = "celltype", value.name = "Number of circuits")
+
+temp_df <- merge(temp_df, temp_num_df, by = c("module", "celltype"))
+
+# order
+temp_df$celltype <- factor(temp_df$celltype, levels = rev(celltypes_order_plot))
+temp_df$module <- factor(temp_df$module, levels = modules_plot)
+
+temp_df$`P value` <- ifelse(temp_df$`P value` < 1e-50, yes = 1e-50, no = temp_df$`P value`)
+temp_df$`Number of circuits` <- ifelse(temp_df$`Number of circuits` > 100, yes = 100, no = temp_df$`Number of circuits`)
+
+ggplot(temp_df) + 
+    geom_point(aes(x = module, y = celltype, size = `Number of circuits`, color = -log10(`P value`))) + 
+    scale_size_area(breaks = c(10, 50, 100)) +
+    scale_color_gradient2(low = "#CCCCCC", high = "#CC0000") +
+    theme_void() + 
+    theme(axis.text.x = element_text(size = 10, angle = 90, hjust = 1, vjust = 0.5),
+          axis.text.y = element_text(size = 12, angle = 0, hjust = 1, vjust = 0.5),
+          legend.title = element_text(size = 12), legend.text = element_text(size = 12))
+ggsave(file.path("../application/10X_pbmc/", paste0("dot_module-celltype-num-p", ".pdf")), width = 6, height = 4)
+```
+
+# Example TF
+
+```{r}
+tf_select <- "TCF7"
+
+celltypes_select_plot <- c("Naive T", "Central memory T")
+data_multi_new_subset <- subset(data_multi_new, cells = colnames(data_multi_new)[data_multi_new$celltype_annotation %in% celltypes_select_plot])
+
+circuits_select_df <- crema_gene_tf_site_select_df[crema_gene_tf_site_select_df$TF == tf_select, ]
+targets_select <- unique(circuits_select_df$gene)
+
+circuit_activity_mtx_by_celltype <- circuit_posRatio_mtx_by_celltype
+
+# Circuit activity -----
+temp_mtx <- circuit_activity_mtx_by_celltype[circuits_select_df$id, celltypes_select_plot]
+temp_mtx <- temp_mtx[rowSums(temp_mtx > 0.001) > 0, ]
+
+temp_mtx <- temp_mtx / rowMaxs(temp_mtx)
+
+temp_mtx <- t(temp_mtx)
+
+targets_list_by_circuit_activity <- list(`Central memory T` = colnames(temp_mtx)[temp_mtx["Central memory T",] == 1 & temp_mtx["Naive T",] < 0.5],
+                                         `Naive T` = colnames(temp_mtx)[temp_mtx["Central memory T",] < 0.5 & temp_mtx["Naive T",] == 1],
+                                         `Both` = colnames(temp_mtx)[temp_mtx["Central memory T",] >= 0.5 & temp_mtx["Naive T",] >= 0.5])
+
+targets_list_by_circuit_activity <- lapply(targets_list_by_circuit_activity,
+                                           function(x){unique(sapply(strsplit(x, split = "_"), function(y){y[3]}))})
+sapply(targets_list_by_circuit_activity, length)
+```
+
+
+```{r}
+# Target gene activity -----
+targets_select_celltype_mtx <- do.call("cbind", 
+                                       lapply(celltype_cell_coarse_list,
+                                              function(x){matrix(rowMeans(data_multi_new@assays$SCT@counts[targets_select, x, drop = F]), 
+                                                                 nrow = length(targets_select), ncol = 1)}))
+row.names(targets_select_celltype_mtx) <- targets_select
+colnames(targets_select_celltype_mtx) <- names(celltype_cell_coarse_list)
+
+temp_mtx <- targets_select_celltype_mtx[ , celltypes_select_plot]
+temp_mtx <- temp_mtx[rowSums(temp_mtx > 0.05) > 0, ]
+
+temp_mtx <- temp_mtx / rowMaxs(temp_mtx)
+
+temp_mtx <- t(temp_mtx)
+
+targets_list_by_gene_activity <- list(`Central memory T` = colnames(temp_mtx)[temp_mtx["Central memory T",] == 1 & temp_mtx["Naive T",] < 0.7],
+                                      `Naive T` = colnames(temp_mtx)[temp_mtx["Central memory T",] < 0.7 & temp_mtx["Naive T",] == 1],
+                                      `Both` = colnames(temp_mtx)[temp_mtx["Central memory T",] >= 0.7 & temp_mtx["Naive T",] >= 0.7])
+```
+
+```{r}
+targets_list_select <- sapply(names(targets_list_by_gene_activity), 
+                              function(x){intersect(targets_list_by_circuit_activity[[x]], targets_list_by_gene_activity[[x]])},
+                              USE.NAMES = T, simplify = F)
+sapply(targets_list_select, length)
+
+sapply(targets_list_select, function(x){c("CD8A", "LRRN3", "LTA", "RPL34", "MAP3K4", "ITGAL") %in% x})
+```
+
+```{r}
+for (x in names(targets_list_select)){
+    print(paste(x, paste(targets_list_select[[x]], collapse = " ")))
+}
+```
+
+
+# Example Gene
+
+```{r}
+gene_select <- "LTA"
+
+circuit_select <- "TCF7_chr6-31562054-31562064_LTA"
+
+DimPlot(data_multi, reduction = "umap", group.by = "predicted.id", label = T, repel = T) + NoLegend()
+FeaturePlot(data_multi, features = "LTA", reduction = "umap")
+```
+

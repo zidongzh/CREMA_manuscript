@@ -1,0 +1,209 @@
+---
+title: CREMA on 10X pbmc
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+
+```{r}
+library(Seurat)
+library(Signac)
+
+library(TFBSTools)
+library(motifmatchr)
+
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+library(Matrix)
+library(matrixStats)
+
+library(parallel)
+```
+
+```{r}
+devtools::load_all("../CREMA/")
+```
+
+
+# Data
+
+Follow the Signac 10X multiome vignettes
+
+```{r}
+dataset_name <- "multiome"
+
+data_multi <- readRDS(file.path("../data_seurat_object/10X_pbmc", paste0(dataset_name, ".rds")))
+
+frag_object_inserts <- CreateFragmentObject(path = file.path("/Genomics/Users/zidongz/crema/data/10X_pbmc", dataset_name,
+                                                                          "pbmc_granulocyte_sorted_10k_atac_inserts.tsv.gz"), 
+                                                         cells = colnames(data_multi))
+```
+
+
+# Prepare
+
+```{r}
+# gene annotation
+print("using gene annotation from EnsDb.Hsapiens.v86")
+
+genebody_coords <- keepStandardChromosomes(ensembldb::genes(EnsDb.Hsapiens.v86), 
+                                           species = "Homo_sapiens", pruning.mode = 'coarse')
+
+# change style of seqnames
+# This may not work because UCSC recently changed their format. Should be fixed in the latest Bioconductor. But if not, use the following workaround, which should at least work for the main chromosomes
+# seqlevelsStyle(genebody_coords) <- 'UCSC'
+# # work around:
+seqlevels(genebody_coords) <- paste0("chr", seqlevels(genebody_coords))
+```
+
+```{r}
+# For gene symbols that have more than one occurrences in the annotation, select the one with "protein_coding"
+genebody_coords <- genebody_coords[sapply(genebody_coords$gene_name, nchar) > 0]
+temp_ind <- table(genebody_coords$gene_name)
+temp_ind <- names(temp_ind)[temp_ind > 1]
+
+genebody_coords_list <- split(genebody_coords, f = genebody_coords$gene_name)
+temp_func <- function(x){
+    if ("protein_coding" %in% x$gene_biotype){ return(x[x$gene_biotype == "protein_coding"])
+    }else{ return(x) }
+}
+genebody_coords_list <- c(lapply(genebody_coords_list[temp_ind], temp_func),
+                          as.list(genebody_coords_list[setdiff(names(genebody_coords_list), temp_ind)]))
+
+genebody_coords <- unlist(as(genebody_coords_list, "GRangesList"))
+genebody_coords <- sort(genebody_coords)
+```
+
+```{r}
+motif_database <- "jaspar"
+motifs <- readRDS(file.path("../CREMA/crema_resource/tf_motifs/data_rds", paste0("motifs_pwmlist_human_", motif_database, ".rds")))
+
+# motifs are named as "TF_MotifID"
+motif_tfs <- unique(sapply(strsplit(names(motifs), split = "_"), function(x){x[1]}))
+```
+
+
+
+# Process data
+
+## Select genes
+
+```{r}
+# filter for genes above a 
+exp_mtx <- GetAssayData(data_multi, assay = "RNA", slot = "counts")
+exp_mtx <- filter_exp_mtx_genes(exp_mtx, gene_names_remove_pattern = "^MT-", proportion_cells_detected = 1e-3)
+
+# Select TFs included in the model
+TFs_select <- intersect(motif_tfs, row.names(exp_mtx))
+
+# Select target genes
+genes_select <- row.names(exp_mtx)
+
+# Filter for genes with annotated TSS and not in chrM
+chromosomes <- paste0("chr", c(seq(1,22), "X", "Y"))
+genes_select <- genes_select[genes_select %in% genebody_coords$symbol[as.character(seqnames(genebody_coords)) %in% chromosomes]]
+
+
+print(paste("num of TFs selected:", length(TFs_select)))
+print(paste("num of genes selected:", length(genes_select)))
+```
+
+## RNA matrix
+
+We use the `counts` matrix from the `SCT` assay (after running `SCTransform` on the data) as the data matrix for RNA levels in the CREMA model. Before obtaining the 
+
+```{r}
+exp_mtx <- GetAssayData(data_multi, assay = "SCT", slot = "counts")
+
+# there might be a few gene names that are dropped by SCTransform
+TFs_select <- intersect(TFs_select, row.names(exp_mtx))
+genes_select <- intersect(genes_select, row.names(exp_mtx))
+
+exp_mtx <- as.matrix(exp_mtx[union(TFs_select, genes_select), ])
+```
+
+
+# Run CREMA
+
+## Candidate regions
+
+We select a +/- 100kb window surrounding the TSS as the candidate region for motif analysis and modeling. 
+
+```{r}
+crema_regions <- select_proximal_regions(genes = genes_select, 
+                                         gene_body_gr = genebody_coords, 
+                                         window_up = 100000, window_down = 100000)
+
+# transform the GRanges objects into strings
+crema_regions_str <- lapply(crema_regions, Signac::GRangesToString)
+```
+
+
+## Run CREMA
+
+```{r}
+genes_select <- intersect(genes_select, names(crema_regions_str))
+site_extension <- 200
+
+batchSize <- 500
+
+output_dir <- file.path("../linear_model_results/", paste0("10X_pbmc-proximal", "-site", site_extension, "_", motif_database))
+dir.create(file.path(output_dir), recursive = T, showWarnings = F)
+dir.create(file.path(output_dir, "temp"), recursive = T, showWarnings = F)
+
+regression_method <- "ols"
+
+for (i in seq(1, ceiling(length(genes_select)/batchSize))){
+    
+    print(i)
+    temp_targets <- genes_select[(batchSize*(i-1)+1) : min(batchSize*i, length(genes_select))]
+    
+    lm.models_tf_ATACweighted_highres <- mclapply(temp_targets,
+                                                  function(x){ATAC_weighted_tf_model_highres(x,
+                                                                                             TFs = motif_tfs,
+                                                                                             regions_str = crema_regions_str[[x]],
+                                                                                             exp_mtx = exp_mtx,
+                                                                                             motifs = motifs,
+                                                                                             fragment_object = frag_object_inserts,
+                                                                                             cells = colnames(data_multi),
+                                                                                             genome = BSgenome.Hsapiens.UCSC.hg38,
+                                                                                             return_val = "list",
+                                                                                             regression_method = regression_method,
+                                                                                             site_extension = site_extension)},
+                                                  mc.cores = 48)
+    names(lm.models_tf_ATACweighted_highres) <- temp_targets
+    
+    lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+    
+    saveRDS(lm.models_tf_ATACweighted_highres,
+            file.path(output_dir, "temp",
+                      paste0("crema-", regression_method, "-", "SCTcounts",
+                             "_allTFs-allGenes-ATACweighted-highres_",
+                             dataset_name, "_", i, ".rds")))
+}
+
+lm.models_tf_ATACweighted_highres_all <- NULL
+for (i in seq(1, ceiling(length(genes_select)/batchSize))){
+    
+    lm.models_tf_ATACweighted_highres <- readRDS(
+        file.path(output_dir, "temp",
+                  paste0("crema-", regression_method, "-",lm_data_use_rna$assay, lm_data_use_rna$slot,
+                         "_allTFs-allGenes-ATACweighted-highres_",
+                         dataset_name, "_", i, ".rds")))
+    
+    lm.models_tf_ATACweighted_highres_all <- c(lm.models_tf_ATACweighted_highres_all,
+                                               lm.models_tf_ATACweighted_highres)
+}
+
+saveRDS(lm.models_tf_ATACweighted_highres_all,
+        file.path(output_dir,
+                  paste0("crema-", regression_method, "-",lm_data_use_rna$assay, lm_data_use_rna$slot,
+                         "_allTFs-allGenes-ATACweighted-highres_",
+                         dataset_name, ".rds")))
+```

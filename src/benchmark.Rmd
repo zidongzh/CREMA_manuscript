@@ -1,0 +1,1200 @@
+---
+title: Benchmarking CREMA on 10X pbmc
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+
+```{r}
+library(Seurat)
+library(Signac) 
+
+library(Matrix)
+library(matrixStats)
+
+library(igraph)
+
+library(monocle3)
+library(cicero)
+
+library(TFBSTools)
+library(motifmatchr)
+
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+
+
+library(data.table)
+
+library(parallel)
+
+library(PRROC)
+
+library(rtracklayer)
+library(liftOver)
+```
+
+```{r}
+devtools::load_all("../CREMA")
+```
+
+# Data
+
+```{r}
+dataset_name <- "multiome"
+
+data_multi <- readRDS(file.path("../data_seurat_object/10X_pbmc", paste0(dataset_name, ".rds")))
+
+frag_object_inserts <- CreateFragmentObject(path = file.path("/Genomics/Users/zidongz/crema/data/10X_pbmc", dataset_name,
+                                                                          "pbmc_granulocyte_sorted_10k_atac_inserts.tsv.gz"), 
+                                                         cells = colnames(data_multi))
+```
+
+```{r}
+# gene annotation
+print("using gene annotation from EnsDb.Hsapiens.v86")
+
+genebody_coords <- keepStandardChromosomes(ensembldb::genes(EnsDb.Hsapiens.v86), 
+                                           species = "Homo_sapiens", pruning.mode = 'coarse')
+
+# change style of seqnames
+# This may not work because UCSC recently changed their format. Should be fixed in the latest Bioconductor. But if not, use the following workaround, which should at least work for the main chromosomes
+# seqlevelsStyle(genebody_coords) <- 'UCSC'
+# # work around:
+seqlevels(genebody_coords) <- paste0("chr", seqlevels(genebody_coords))
+```
+
+```{r}
+# For gene symbols that have more than one occurrences in the annotation, select the one with "protein_coding"
+genebody_coords <- genebody_coords[sapply(genebody_coords$gene_name, nchar) > 0]
+temp_ind <- table(genebody_coords$gene_name)
+temp_ind <- names(temp_ind)[temp_ind > 1]
+
+genebody_coords_list <- split(genebody_coords, f = genebody_coords$gene_name)
+temp_func <- function(x){
+    if ("protein_coding" %in% x$gene_biotype){ return(x[x$gene_biotype == "protein_coding"])
+    }else{ return(x) }
+}
+genebody_coords_list <- c(lapply(genebody_coords_list[temp_ind], temp_func),
+                          as.list(genebody_coords_list[setdiff(names(genebody_coords_list), temp_ind)]))
+
+genebody_coords <- unlist(as(genebody_coords_list, "GRangesList"))
+genebody_coords <- sort(genebody_coords)
+```
+
+```{r}
+motif_database <- "jaspar"
+motifs <- readRDS(file.path("../CREMA/crema_resource/tf_motifs/data_rds", paste0("motifs_pwmlist_human_", motif_database, ".rds")))
+
+# motifs are named as "TF_MotifID"
+motif_tfs <- unique(sapply(strsplit(names(motifs), split = "_"), function(x){x[1]}))
+```
+
+## Select genes
+
+```{r}
+# filter for genes above a 
+exp_mtx <- GetAssayData(data_multi, assay = "RNA", slot = "counts")
+exp_mtx <- filter_exp_mtx_genes(exp_mtx, gene_names_remove_pattern = "^MT-", proportion_cells_detected = 1e-3)
+
+# Select TFs included in the model
+TFs_select <- intersect(motif_tfs, row.names(exp_mtx))
+
+# Select target genes
+genes_select <- row.names(exp_mtx)
+
+# Filter for genes with annotated TSS and not in chrM
+chromosomes <- paste0("chr", c(seq(1,22), "X", "Y"))
+genes_select <- genes_select[genes_select %in% genebody_coords$symbol[as.character(seqnames(genebody_coords)) %in% chromosomes]]
+
+
+print(paste("num of TFs selected:", length(TFs_select)))
+print(paste("num of genes selected:", length(genes_select)))
+```
+
+## RNA matrix
+
+We use the `counts` matrix from the `SCT` assay (after running `SCTransform` on the data) as the data matrix for RNA levels in the CREMA model. Before obtaining the 
+
+```{r}
+exp_mtx <- GetAssayData(data_multi, assay = "SCT", slot = "counts")
+
+# there might be a few gene names that are dropped by SCTransform
+TFs_select <- intersect(TFs_select, row.names(exp_mtx))
+genes_select <- intersect(genes_select, row.names(exp_mtx))
+
+exp_mtx <- as.matrix(exp_mtx[union(TFs_select, genes_select), ])
+```
+
+## CREMA regions
+
+```{r}
+crema_regions <- select_proximal_regions(genes = genes_select, 
+                                         gene_body_gr = genebody_coords, 
+                                         window_up = 100000, window_down = 100000)
+
+# transform the GRanges objects into strings
+crema_regions_str <- lapply(crema_regions, Signac::GRangesToString)
+```
+
+
+# Evaluation datasets
+
+## GTEx eQTLs
+
+```{r}
+# gtex_tissue <- "Whole_Blood"
+# GTEx_dataset_names <- c("Association", "CaVEMaN", "CAVIAR", "DAPG")
+# 
+# gtex_db_list <- list()
+# for (gtex_name in GTEx_dataset_names){
+#     print(gtex_name)
+#     gtex_gene_var_list <- readRDS(file.path("../resource/gtex_gene-var/", paste0("gtex_gene-var-list_", gtex_tissue, "_", gtex_name, ".rds")))
+#     
+#     temp_genes <- intersect(names(crema_regions), names(gtex_gene_var_list))
+#     gtex_gene_var_list <- mclapply(temp_genes, function(x){intersect(StringToGRanges(gtex_gene_var_list[[x]]), crema_regions[[x]])}, mc.cores = 60)
+#     names(gtex_gene_var_list) <- temp_genes
+#     
+#     gtex_gene_var_list <- gtex_gene_var_list[sapply(gtex_gene_var_list, length) > 0]
+#     
+#     gtex_db_list[[gtex_name]] <- gtex_gene_var_list
+# }
+# 
+# saveRDS(gtex_db_list, "../eval_regions/10X_pbmc/goldstandards_eQTLs.rds")
+
+gtex_db_list <- readRDS("../eval_regions/10X_pbmc/goldstandards_eQTLs.rds")
+```
+
+## Enhancer
+
+```{r}
+# fantom <- readRDS('../benchmark/tripod/TRIPOD/scripts/10x_pbmc/data/fantom.grl.rds')
+# fourDG <- readRDS('../benchmark/tripod/TRIPOD/scripts/10x_pbmc/data/four.d.genome.grl.rds')
+# 
+# enhancerAtlas <- readRDS('../resource/enhancer_databases/processed_rds/enhanceratlas_blood.rds')
+# 
+# enhancer_db_list <- list(fantom = fantom, fourDG = fourDG, enhancerAtlas = enhancerAtlas)
+# 
+# for (enhancer_db_name in names(enhancer_db_list)){
+#     print(enhancer_db_name)
+#     enhancer_gene_region_list <- enhancer_db_list[[enhancer_db_name]]
+# 
+#     temp_genes <- intersect(names(crema_regions), names(enhancer_gene_region_list))
+#     enhancer_gene_region_list <- mclapply(temp_genes, function(x){GenomicRanges::intersect(enhancer_gene_region_list[[x]], 
+#                                                                                            crema_regions[[x]], ignore.strand = T)}, mc.cores = 48)
+#     names(enhancer_gene_region_list) <- temp_genes
+# 
+#     enhancer_gene_region_list <- enhancer_gene_region_list[sapply(enhancer_gene_region_list, length) > 0]
+# 
+#     enhancer_db_list[[enhancer_db_name]] <- enhancer_gene_region_list
+# }
+# 
+# saveRDS(enhancer_db_list, "../eval_regions/10X_pbmc/goldstandards_enhancers_new.rds")
+
+enhancer_db_list <- readRDS("../eval_regions/10X_pbmc/goldstandards_enhancers_new.rds")
+```
+
+## Peak vs nonpeak
+
+```{r}
+eval_databases_list <- c(enhancer_db_list, gtex_db_list[2:4])
+
+eval_databases_peak_percentage_list <- list()
+
+peaks.gr <- data_multi[["ATAC"]]@ranges
+
+# In-peak and Non-peak enhancer regions
+for (eval_db_name in names(eval_databases_list)){
+    
+    print(eval_db_name)
+    eval_db_gene_region_list <- eval_databases_list[[eval_db_name]]
+    temp_targets <- intersect(names(crema_regions), names(eval_db_gene_region_list))
+    
+    # restrict to +/- 100kb 
+    eval_db_gene_region_list <- eval_db_gene_region_list[temp_targets]
+    eval_db_gene_region_list <- mclapply(temp_targets, function(x){intersect(eval_db_gene_region_list[[x]], crema_regions[[x]])}, mc.cores = 40)
+    names(eval_db_gene_region_list) <- temp_targets
+    eval_db_gene_region_list <- eval_db_gene_region_list[sapply(eval_db_gene_region_list, length) > 0]
+    
+    # # Binary in/out peak
+    # eval_db_gene_region_inpeak <- mclapply(eval_db_gene_region_list, function(x){subsetByOverlaps(x, peaks.gr, invert = F)}, mc.cores = 40)
+    # eval_db_gene_region_nonpeak <- mclapply(eval_db_gene_region_list, function(x){subsetByOverlaps(x, peaks.gr, invert = T)}, mc.cores = 40)
+    # pie(c(sum(sapply(eval_db_gene_region_inpeak, length)),
+    #       sum(sapply(eval_db_gene_region_nonpeak, length))),
+    #     labels = c("peak", "non-peak"),
+    #     main = paste(eval_db_name, "regions in ATAC peaks and out of ATAC peaks"))
+    
+    # Area of in/out peak
+    eval_db_gene_region_inpeak <- mclapply(eval_db_gene_region_list, function(x){intersect(x, peaks.gr)}, mc.cores = 40)
+    eval_db_area_in_peak <- sum(sapply(eval_db_gene_region_inpeak, function(x){sum(width(x))}))
+    eval_db_area_all <- sum(sapply(eval_db_gene_region_list, function(x){sum(width(x))}))
+    
+    eval_databases_peak_percentage_list[[eval_db_name]] <- list(inpeak = eval_db_area_in_peak,
+                                                                nonpeak = eval_db_area_all - eval_db_area_in_peak)
+    temp_percent <- eval_db_area_in_peak / eval_db_area_all
+    temp_percent <- format(c(temp_percent, 1-temp_percent) * 100, digits = 2)
+    
+    pie(c(eval_db_area_in_peak, eval_db_area_all - eval_db_area_in_peak),
+        labels = paste0(c("peak", "non-peak"), " ", temp_percent, "%"), col = c("#DDDEDF", "#00BBFF"), 
+        main = paste(eval_db_name))
+    pie(c(eval_db_area_in_peak, eval_db_area_all - eval_db_area_in_peak),
+        labels = c("", ""),
+        main = paste(eval_db_name))
+}
+
+saveRDS(eval_databases_peak_percentage_list, 
+        file.path("../eval_regions/10X_pbmc/goldstandards_peak-nonpeak.rds"))
+```
+
+```{r}
+eval_databases_peak_percentage_list <- readRDS(file.path("../eval_regions/10X_pbmc/goldstandards_peak-nonpeak.rds"))
+
+for (eval_db_name in names(eval_databases_peak_percentage_list)){
+    eval_db_area_in_peak <- eval_databases_peak_percentage_list[[eval_db_name]]$inpeak
+    eval_db_area_out_peak <- eval_databases_peak_percentage_list[[eval_db_name]]$nonpeak
+    
+    temp_percent <- eval_db_area_in_peak / (eval_db_area_in_peak + eval_db_area_out_peak)
+    temp_percent <- format(c(temp_percent, 1-temp_percent) * 100, digits = 2)
+    
+    pie(c(eval_db_area_in_peak, eval_db_area_out_peak),
+        labels = paste0(c("peak", "non-peak"), " ", temp_percent, "%"), col = c("#DDDEDF", "#00BBFF"), 
+        main = paste(eval_db_name))
+    pie(c(eval_db_area_in_peak, eval_db_area_out_peak),
+        labels = c("", ""), col = c("#DDDEDF", "#00BBFF"), 
+        main = paste(eval_db_name))
+}
+```
+
+
+# CREMA results
+
+```{r}
+site_extension <- 200
+regression_method <- "ols"
+
+smooth_k <- 0
+smooth_name <- ifelse(smooth_k == 0, yes = "", no = paste0("smooth-", smooth_k, "_"))
+
+output_dir <- file.path("../linear_model_results/", paste0("10X_pbmc-proximal", "-site", site_extension, "_", motif_database))
+lm.models_tf_ATACweighted_highres <- readRDS(file.path(output_dir,
+                                                       paste0("crema-", regression_method, "-", "SCTcounts", 
+                                                              "_allTFs-allGenes-ATACweighted-highres_",
+                                                              smooth_name,
+                                                              dataset_name, ".rds")))
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[sapply(lm.models_tf_ATACweighted_highres, length) > 1]
+
+crema_gene_tf_site_df_all <- do.call("rbind",
+                              lapply(names(lm.models_tf_ATACweighted_highres),
+                                     function(x){data.frame(gene = x, 
+                                                            site = names(lm.models_tf_ATACweighted_highres[[x]]$p),
+                                                            t = lm.models_tf_ATACweighted_highres[[x]]$t,
+                                                            p_val = lm.models_tf_ATACweighted_highres[[x]]$p)}))
+crema_gene_tf_site_df_all <- crema_gene_tf_site_df_all[crema_gene_tf_site_df_all$t > 0, ]
+
+temp <- strsplit(crema_gene_tf_site_df_all$site, split = "_")
+crema_gene_tf_site_df_all$TF <- sapply(temp, function(x){x[1]})
+crema_gene_tf_site_df_all$site <- sapply(temp, function(x){x[2]})
+```
+
+```{r}
+# Remove duplicating entries
+crema_by_tf_list <- split(crema_gene_tf_site_df_all, crema_gene_tf_site_df_all$TF)
+
+temp_func <- function(temp_df){
+    temp_sites_str <- unique(temp_df$site)
+    temp_sites_gr <- StringToGRanges(temp_sites_str)
+    temp_sites_reduce <- reduce(temp_sites_gr)
+    
+    temp_sites_reduce <- unlist(tile(temp_sites_reduce, width = 50), recursive = T)
+    
+    temp_overlap <- findOverlaps(temp_sites_gr, temp_sites_reduce, minoverlap = floor(min(width(temp_sites_gr))/2))
+    temp_overlap_df <- data.frame(site = temp_sites_str[temp_overlap@from],
+                                  site_reduce = GRangesToString(temp_sites_reduce)[temp_overlap@to])
+    
+    temp_df <- merge(temp_df, temp_overlap_df, by = "site", all.x = T)
+    return(temp_df)
+}
+crema_by_tf_list <- mclapply(crema_by_tf_list, temp_func, mc.cores = 48)
+
+crema_gene_tf_site_reduced_df <- do.call("rbind", crema_by_tf_list)
+crema_gene_tf_site_reduced_df$site <- crema_gene_tf_site_reduced_df$site_reduce
+crema_gene_tf_site_reduced_df$site_reduce <- NULL
+
+crema_gene_tf_site_reduced_df <- data.table(crema_gene_tf_site_reduced_df)
+
+crema_gene_tf_site_reduced_df <- crema_gene_tf_site_reduced_df[ , list(p_val = min(p_val), t = max(t)), by = list(TF, site, gene)]
+```
+
+
+# TRIPOD results
+
+## Data
+
+```{r}
+library(TRIPOD)
+
+library(BiocParallel)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(Seurat)
+library(SeuratDisk)
+library(Signac)
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(chromVAR)
+library(JASPAR2020)
+library(TFBSTools)
+library(motifmatchr)
+```
+
+```{r}
+pbmc <- readRDS("../benchmark/tripod/10X_pbmc/pbmc.chromvar.annotated.rds")
+tripod.pbmc <- getObjectsForModelFit(object = pbmc, chr = paste0("chr", 1:22), convert = FALSE)
+
+transcripts.gr <- tripod.pbmc$transcripts.gr
+peaks.gr <- tripod.pbmc$peaks.gr
+motifxTF <- tripod.pbmc$motifxTF
+peakxmotif <- tripod.pbmc$peakxmotif
+```
+
+```{r}
+temp_widths <- width(peaks.gr)
+hist(temp_widths, main = "ATAC peaks widths")
+hist(temp_widths[temp_widths<5e3], main = "ATAC peaks widths")
+```
+
+```{r}
+pbmc <- filterSeuratObject(object = pbmc, tripod.object = tripod.pbmc)
+```
+
+```{r}
+pbmc <- processSeuratObject(object = pbmc, dim.rna = 1:50, dim.atac = 2:50,
+    verbose = FALSE)
+```
+
+```{r}
+set.seed(123)
+num.clusters <- optimizeResolution(
+    object = pbmc,
+    graph.name = "wsnn",
+    assay.name = "WNN",
+    resolutions = seq(10, 35, 5),
+    min.num = 20
+)
+
+res <- 15
+pbmc <- getClusters(object = pbmc, graph.name = "wsnn", algorithm = 3,
+        resolution = res, verbose = FALSE)
+
+metacell.pbmc <- getMetacellMatrices(object = pbmc,
+  cluster.name = "seurat_clusters"
+)
+```
+
+```{r}
+metacell.rna <- metacell.pbmc$rna
+metacell.peak <- metacell.pbmc$peak
+
+pbmc$celltype=factor(pbmc$celltype)
+color.pbmc <- getColors(object = pbmc)
+
+metacell.celltype <- color.pbmc$metacell$celltype
+metacell.celltype.col <- color.pbmc$metacell$color
+```
+
+```{r}
+DefaultAssay(pbmc) <- "SCT"
+hvg.pbmc <- VariableFeatures(pbmc)
+```
+
+```{r}
+saveRDS(pbmc, file = '../benchmark/tripod/pbmc.rds')
+
+pbmc.transcripts.gr=transcripts.gr
+save(pbmc.transcripts.gr, file = '../benchmark/tripod/pbmc.transcripts.gr.rda')
+pbmc.peaks.gr=peaks.gr
+save(pbmc.peaks.gr, file='../benchmark/tripod/pbmc.peaks.gr.rda')
+pbmc.motifxTF=motifxTF
+save(pbmc.motifxTF, file='../benchmark/tripod/pbmc.motifxTF.rda')
+pbmc.peakxmotif=peakxmotif
+save(pbmc.peakxmotif, file='../benchmark/tripod/pbmc.peakxmotif.rda')
+pbmc.metacell.rna=metacell.rna
+save(pbmc.metacell.rna, file='../benchmark/tripod/pbmc.metacell.rna.rda')
+pbmc.metacell.peak=metacell.peak
+save(pbmc.metacell.peak, file='../benchmark/tripod/pbmc.metacell.peak.rda')
+pbmc.metacell.celltype=metacell.celltype
+save(pbmc.metacell.celltype, file='../benchmark/tripod/pbmc.metacell.celltype.rda')
+pbmc.metacell.celltype.col=metacell.celltype.col
+save(pbmc.metacell.celltype.col, file='../benchmark/tripod/pbmc.metacell.celltype.col.rda')
+```
+
+## Run Tripod
+
+```{r}
+library(Seurat)
+library(Signac)
+library(GenomicRanges)
+library(dplyr)
+library(ggplot2)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomeInfoDb)
+library(patchwork)
+library(BiocParallel)
+library(dendextend)
+
+library(TRIPOD)
+```
+
+```{r}
+pbmc <- readRDS('../benchmark/tripod/10X_pbmc/pbmc.rds')
+
+load('../benchmark/tripod/10X_pbmc/pbmc.transcripts.gr.rda')
+load('../benchmark/tripod/10X_pbmc/pbmc.peaks.gr.rda')
+load('../benchmark/tripod/10X_pbmc/pbmc.motifxTF.rda')
+load('../benchmark/tripod/10X_pbmc/pbmc.peakxmotif.rda')
+load('../benchmark/tripod/10X_pbmc/pbmc.metacell.rna.rda')
+load('../benchmark/tripod/10X_pbmc/pbmc.metacell.peak.rda')
+load('../benchmark/tripod/10X_pbmc/pbmc.metacell.celltype.rda')
+load('../benchmark/tripod/10X_pbmc/pbmc.metacell.celltype.col.rda')
+```
+
+```{r}
+DefaultAssay(pbmc) <- "SCT"
+temp <- FindVariableFeatures(pbmc, nfeatures = 6000)
+var_genes <- VariableFeatures(temp)
+```
+
+```{r}
+ext.upstream <- ext.downstream <- 1e5
+
+# genes <- Reduce("intersect", list(genes.select, var_genes, colnames(pbmc.metacell.rna)))
+genes <- Reduce("intersect", list(genes.select, colnames(pbmc.metacell.rna)))
+print(length(genes))
+```
+
+```{r}
+# XY mat list =====
+xymats.list <- bplapply(
+  genes,
+  getXYMatrices,
+  ext.upstream = ext.upstream,
+  transcripts.gr = pbmc.transcripts.gr,
+  peaks.gr = pbmc.peaks.gr,
+  metacell.rna = pbmc.metacell.rna,
+  metacell.peak = pbmc.metacell.peak,
+  peakxmotif = pbmc.peakxmotif,
+  motifxTF = pbmc.motifxTF,
+  metacell.celltype = pbmc.metacell.celltype,
+  metacell.celltype.col = pbmc.metacell.celltype.col
+)
+names(xymats.list) <- genes
+
+
+# run TRIPOD matching Xt -----
+temp_func <- function(x){
+    tryCatch({
+        fitModel(x, model.name = "TRIPOD", match.by = "Xt")
+    },
+    error = function(e){return(NA)})
+}
+xymats.tripod.Xt.list <- bplapply(xymats.list, temp_func)
+names(xymats.tripod.Xt.list) <- genes
+
+# run TRIPOD matching Yj -----
+temp_func <- function(x){
+    tryCatch({
+        fitModel(x, model.name = "TRIPOD", match.by = "Yj")
+    },
+    error = function(e){return(NA)})
+}
+xymats.tripod.Yj.list <- bplapply(xymats.list, temp_func)
+names(xymats.tripod.Yj.list) <- genes
+
+
+# Save =====
+xymats.tripod.Xt.list <- xymats.tripod.Xt.list[!is.na(xymats.tripod.Xt.list)]
+xymats.tripod.Yj.list <- xymats.tripod.Yj.list[!is.na(xymats.tripod.Yj.list)]
+
+saveRDS(xymats.tripod.Xt.list, "../benchmark/tripod/10X_pbmc/xymats.tripod.Xt.list.rds")
+saveRDS(xymats.tripod.Yj.list, "../benchmark/tripod/10X_pbmc/xymats.tripod.Yj.list.rds")
+```
+
+
+```{r}
+# library(TRIPOD)
+
+pbmc <- readRDS("../benchmark/tripod/10X_pbmc/pbmc.chromvar.annotated.rds")
+tripod.pbmc <- getObjectsForModelFit(object = pbmc, chr = paste0("chr", 1:22), convert = FALSE)
+peaks.gr <- tripod.pbmc$peaks.gr
+peaks.tripod.gr <- tripod.pbmc$peaks.gr
+
+xymats.tripod.Xt.list <- readRDS("../benchmark/tripod/10X_pbmc/xymats.tripod.Xt.list.rds")
+xymats.tripod.Yj.list <- readRDS("../benchmark/tripod/10X_pbmc/xymats.tripod.Yj.list.rds")
+```
+
+```{r}
+# set FDR = 1 to save all results
+# fdr.thresh <- 1e-2
+fdr.thresh <- 1
+
+# focus on positive sign
+sign <- "positive"
+
+# TRIPOD level 1 matching Xt
+xymats.tX1.pos.df <- getTrios(
+    xymats.list = xymats.tripod.Xt.list,
+    fdr.thresh = fdr.thresh,
+    sign = sign,
+    model.name = "TRIPOD",
+    level = 1
+)
+head(xymats.tX1.pos.df[order(xymats.tX1.pos.df$adj), ])
+
+# TRIPOD level 2 matching Xt
+xymats.tX2.pos.df <- getTrios(
+    xymats.list = xymats.tripod.Xt.list,
+    fdr.thresh = fdr.thresh,
+    sign = sign,
+    model.name = "TRIPOD",
+    level = 2
+)
+head(xymats.tX2.pos.df[order(xymats.tX2.pos.df$adj), ])
+
+# TRIPOD level 1 matching Xt
+xymats.tY1.pos.df <- getTrios(
+    xymats.list = xymats.tripod.Yj.list,
+    fdr.thresh = fdr.thresh,
+    sign = sign,
+    model.name = "TRIPOD",
+    level = 1
+)
+head(xymats.tY1.pos.df[order(xymats.tY1.pos.df$adj), ])
+
+# TRIPOD level 2 matching Xt
+xymats.tY2.pos.df <- getTrios(
+    xymats.list = xymats.tripod.Yj.list,
+    fdr.thresh = fdr.thresh,
+    sign = sign,
+    model.name = "TRIPOD",
+    level = 2
+)
+head(xymats.tY2.pos.df[order(xymats.tY2.pos.df$adj), ])
+
+out_dir <- "../benchmark/tripod/10X_pbmc/"
+tripod_df <- rbind(xymats.tX1.pos.df, xymats.tX2.pos.df, xymats.tY1.pos.df, xymats.tY2.pos.df)
+saveRDS(tripod_df, file.path(out_dir, "tripod_df.rds"))
+```
+
+## Tripod Results
+
+```{r}
+library(TRIPOD)
+
+pbmc <- readRDS("../benchmark/tripod/10X_pbmc/pbmc.chromvar.annotated.rds")
+tripod.pbmc <- getObjectsForModelFit(object = pbmc, chr = paste0("chr", 1:22), convert = FALSE)
+
+peaks.tripod.gr <- tripod.pbmc$peaks.gr
+
+tripod_df <- readRDS(file.path("../benchmark/tripod/10X_pbmc/tripod_df.rds"))
+tripod_df <- data.table(tripod_df)
+```
+
+
+
+
+# Compare
+
+## CREMA peaks
+
+```{r}
+# Add peak info to the dataframe by overlap =====
+sites_all_str <- unique(crema_gene_tf_site_reduced_df$site)
+sites_all_gr <- StringToGRanges(sites_all_str)
+peaks.tripod.str <- GRangesToString(peaks.tripod.gr)
+
+min_overlap_for_peak <- 3
+
+temp_overlap <- findOverlaps(sites_all_gr, peaks.tripod.gr, minoverlap = min_overlap_for_peak)
+temp_overlap_df <- data.frame(site = sites_all_str[temp_overlap@from],
+                              overlapped_peak = peaks.tripod.str[temp_overlap@to])
+
+crema_gene_tf_site_reduced_df <- merge(crema_gene_tf_site_reduced_df, temp_overlap_df, by = "site", all.x = T, sort = F)
+crema_gene_tf_site_reduced_df$inpeak <- !is.na(crema_gene_tf_site_reduced_df$overlapped_peak)
+
+
+# Combine the peak and sites -----
+# Unify the site and overlapped peak under the same name peak
+# When there's an overlapping peak, use the peak
+# When there's no overlapping peak, use the site
+crema_gene_tf_site_reduced_df$peak <- ifelse(crema_gene_tf_site_reduced_df$inpeak,
+                                             yes = crema_gene_tf_site_reduced_df$overlapped_peak,
+                                             no = crema_gene_tf_site_reduced_df$site)
+
+# crema_gene_tf_sitespeaks_df <- aggregate(crema_gene_tf_site_reduced_df$p_val,
+#                                          by = list(gene = crema_gene_tf_site_reduced_df$gene,
+#                                                    TF = crema_gene_tf_site_reduced_df$TF,
+#                                                    peak = crema_gene_tf_site_reduced_df$peak,
+#                                                    inpeak = crema_gene_tf_site_reduced_df$inpeak),
+#                                          FUN = min)
+# colnames(crema_gene_tf_sitespeaks_df)[colnames(crema_gene_tf_sitespeaks_df) == "x"] <- "p_val"
+
+crema_gene_tf_sitespeaks_df <- crema_gene_tf_site_reduced_df[, list(p_val = min(p_val)), by = list(gene, TF, peak, inpeak)]
+
+
+saveRDS(list(crema_gene_tf_site_reduced_df = crema_gene_tf_site_reduced_df,
+             crema_gene_tf_sitespeaks_df = crema_gene_tf_sitespeaks_df),
+        file.path("../eval_trios/10X_pbmc/results_crema_tf-site-gene_reduce.rds"))
+```
+
+```{r}
+temp <- readRDS(file.path("../eval_trios/10X_pbmc/results_crema_tf-site-gene_reduce.rds"))
+crema_gene_tf_site_reduced_df <- temp$crema_gene_tf_site_reduced_df
+crema_gene_tf_sitespeaks_df <- temp$crema_gene_tf_sitespeaks_df
+rm(temp)
+gc()
+```
+
+
+
+```{r}
+# # All sites -----
+# site_extension <- 200
+# regression_method <- "ols"
+# 
+# smooth_k <- 0
+# smooth_name <- ifelse(smooth_k == 0, yes = "", no = paste0("smooth-", smooth_k, "_"))
+# 
+# output_dir <- file.path("../linear_model_results/", paste0("10X_pbmc-proximal", "-site", site_extension, "_", motif_database))
+# lm.models_tf_ATACweighted_highres <- readRDS(file.path(output_dir,
+#                                                        paste0("crema-", regression_method, "-", lm_data_use_rna$assay, lm_data_use_rna$slot,
+#                                                               "_allTFs-allGenes-ATACweighted-highres_",
+#                                                               smooth_name,
+#                                                               dataset_name, ".rds")))
+# lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+# lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[sapply(lm.models_tf_ATACweighted_highres, length) > 1]
+# 
+# 
+# min_overlap_for_peak <- 0
+# 
+# 
+# # Data frame of gene - tf - site =====
+# temp_func <- function(x){
+#     tf_site_p <- lm.models_tf_ATACweighted_highres[[x]]$p
+#     tf_site_t <- lm.models_tf_ATACweighted_highres[[x]]$t
+#     tf_site <- strsplit(names(tf_site_p), split = "_")
+#     return(data.frame(gene = x,
+#                       TF = sapply(tf_site, function(y){y[1]}),
+#                       site = sapply(tf_site, function(y){y[2]}),
+#                       p_val = tf_site_p,
+#                       t = tf_site_t))
+# }
+# crema_gene_tf_site_df_all <- mclapply(names(lm.models_tf_ATACweighted_highres), temp_func, mc.cores = 60)
+# crema_gene_tf_site_df_all <- do.call("rbind", crema_gene_tf_site_df_all)
+# 
+# 
+# # Add peak info to the dataframe by overlap =====
+# sites_all_str <- unique(crema_gene_tf_site_df_all$site)
+# sites_all_gr <- StringToGRanges(sites_all_str)
+# peaks.tripod.str <- GRangesToString(peaks.tripod.gr)
+# 
+# temp_overlap <- findOverlaps(sites_all_gr, peaks.tripod.gr, minoverlap = min_overlap_for_peak)
+# temp_overlap_df <- data.frame(site = sites_all_str[temp_overlap@from],
+#                               overlapped_peak = peaks.tripod.str[temp_overlap@to])
+# 
+# crema_gene_tf_site_df_all <- merge(crema_gene_tf_site_df_all, temp_overlap_df, by = "site", all.x = T, sort = F)
+# crema_gene_tf_site_df_all$inpeak <- !is.na(crema_gene_tf_site_df_all$overlapped_peak)
+# 
+# 
+# # Combine the peak and sites -----
+# # Unify the site and overlapped peak under the same name peak
+# # When there's an overlapping peak, use the peak
+# # When there's no overlapping peak, use the site
+# crema_gene_tf_site_df_all$peak <- ifelse(crema_gene_tf_site_df_all$inpeak,
+#                                          yes = crema_gene_tf_site_df_all$overlapped_peak,
+#                                          no = crema_gene_tf_site_df_all$site)
+# crema_gene_tf_sitespeaks_df <- aggregate(crema_gene_tf_site_df_all$p_val,
+#                                          by = list(gene = crema_gene_tf_site_df_all$gene,
+#                                                    TF = crema_gene_tf_site_df_all$TF,
+#                                                    peak = crema_gene_tf_site_df_all$peak,
+#                                                    inpeak = crema_gene_tf_site_df_all$inpeak),
+#                                          FUN = min)
+# colnames(crema_gene_tf_sitespeaks_df)[colnames(crema_gene_tf_sitespeaks_df) == "x"] <- "p_val"
+# 
+# saveRDS(list(crema_gene_tf_site_df_all = crema_gene_tf_site_df_all,
+#              crema_gene_tf_sitespeaks_df = crema_gene_tf_sitespeaks_df),
+#         file.path("../eval_trios/10X_pbmc/results_crema_tf-site-gene.rds"))
+```
+
+```{r}
+# temp <- readRDS(file.path("../eval_trios/10X_pbmc/results_crema_tf-site-gene.rds"))
+# crema_gene_tf_site_df_all <- temp$crema_gene_tf_site_df_all
+# crema_gene_tf_sitespeaks_df <- temp$crema_gene_tf_sitespeaks_df
+# rm(temp)
+# gc()
+        
+# # Extend the sites -----
+# temp <- GRangesToString(Extend_Granges(StringToGRanges(crema_gene_tf_sitespeaks_df$peak),
+#                                        upstream = 200, downstream = 200, from.midpoint = T))
+# crema_gene_tf_sitespeaks_df$peak <- ifelse(crema_gene_tf_sitespeaks_df$inpeak, yes = crema_gene_tf_sitespeaks_df$peak, no = temp)
+```
+
+## Number of circuits
+
+```{r}
+# TRIPOD results
+
+# tripod_gene_tf_peak_df_all <- aggregate(tripod_df$pval,
+#                                         by = list(gene = tripod_df$gene,
+#                                                   TF = tripod_df$TF,
+#                                                   peak = tripod_df$peak),
+#                                         FUN = min)
+# colnames(tripod_gene_tf_peak_df_all)[colnames(tripod_gene_tf_peak_df_all) == "x"] <- "p_val"
+
+tripod_gene_tf_peak_df_all <- tripod_df[, list(p_val = min(pval)), by = list(gene, TF, peak)]
+```
+
+```{r}
+temp_numm_df <- data.frame(method = c("CREMA", "Tripod"),
+                           row.names = c("CREMA", "Tripod"))
+
+fdr_cutoff <- 5e-3
+
+genes_intersect <- intersect(crema_gene_tf_site_reduced_df$gene, tripod_gene_tf_peak_df_all$gene)
+
+
+temp_numm_df["CREMA", "peaks"] <- sum(p.adjust(crema_gene_tf_site_reduced_df$p_val, method = "fdr") < fdr_cutoff & 
+                                          crema_gene_tf_site_reduced_df$inpeak & 
+                                          crema_gene_tf_site_reduced_df$gene %in% genes_intersect)
+temp_numm_df["CREMA", "nonpeak_sites"] <- sum(p.adjust(crema_gene_tf_site_reduced_df$p_val, method = "fdr") < fdr_cutoff & 
+                                                  !(crema_gene_tf_site_reduced_df$inpeak) & 
+                                                  crema_gene_tf_site_reduced_df$gene %in% genes_intersect)
+
+
+temp_numm_df["Tripod", "peaks"] <- sum(p.adjust(tripod_gene_tf_peak_df_all$p_val, method = "fdr") < fdr_cutoff & 
+                                           tripod_gene_tf_peak_df_all$gene %in% genes_intersect)
+temp_numm_df["Tripod", "nonpeak_sites"] <- 0
+
+colnames(temp_numm_df) <- c("method", "Inside called peaks", "Outside called peaks")
+temp_numm_df <- reshape2::melt(temp_numm_df, id.vars = c("method"), variable.name = "Region", value.name = "size")
+temp_numm_df$method <- factor(temp_numm_df$method, levels = c("CREMA", "Tripod"))
+temp_numm_df$Region <- factor(temp_numm_df$Region, levels = c("Outside called peaks", "Inside called peaks"))
+
+ggplot(temp_numm_df) + 
+    geom_bar(aes(x = method, y = size, fill = Region), color = "black", stat = "identity") + 
+    scale_fill_manual(values = c("#f7c707", "#3c8790"), labels = c("Outside \ncalled peaks", "Inside \ncalled peaks")) + 
+    xlab("Method") + 
+    # ylab("Size (Mb)") +
+    ylab("Number of circuits") +
+    theme_minimal() + 
+    theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1, vjust = 1), 
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 14),
+          legend.title = element_text(size = 14), 
+          legend.text = element_text(size = 14),
+          legend.spacing.y = unit(10, "pt"),
+          legend.margin = margin(t = 20, b = 20)) + 
+    guides(fill = guide_legend(byrow = TRUE))
+ggsave(file.path("../eval_trios/10X_pbmc/Size.pdf"), width = 4, height = 5)
+ggsave(file.path("../eval_trios/10X_pbmc/Size.png"), width = 4, height = 5)
+```
+
+```{r}
+# temp_numm_df <- data.frame(method = c("CREMA", "Tripod"),
+#                            row.names = c("CREMA", "Tripod"))
+# 
+# fdr_cutoff <- 5e-3
+# 
+# genes_intersect <- intersect(crema_gene_tf_site_df_all$gene, tripod_gene_tf_peak_df_all$gene)
+# 
+# 
+# temp_numm_df["CREMA", "peaks"] <- sum(p.adjust(crema_gene_tf_site_df_all$p_val, method = "fdr") < fdr_cutoff & 
+#                                           crema_gene_tf_site_df_all$inpeak & 
+#                                           crema_gene_tf_site_df_all$gene %in% genes_intersect)
+# temp_numm_df["CREMA", "nonpeak_sites"] <- sum(p.adjust(crema_gene_tf_site_df_all$p_val, method = "fdr") < fdr_cutoff & 
+#                                                   !(crema_gene_tf_site_df_all$inpeak) & 
+#                                                   crema_gene_tf_site_df_all$gene %in% genes_intersect)
+# 
+# 
+# temp_numm_df["Tripod", "peaks"] <- sum(p.adjust(tripod_gene_tf_peak_df_all$p_val, method = "fdr") < fdr_cutoff & 
+#                                            tripod_gene_tf_peak_df_all$gene %in% genes_intersect)
+# temp_numm_df["Tripod", "nonpeak_sites"] <- 0
+# 
+# colnames(temp_numm_df) <- c("method", "Inside called peaks", "Outside called peaks")
+# temp_numm_df <- reshape2::melt(temp_numm_df, id.vars = c("method"), variable.name = "Region", value.name = "size")
+# temp_numm_df$method <- factor(temp_numm_df$method, levels = c("CREMA", "Tripod"))
+# temp_numm_df$Region <- factor(temp_numm_df$Region, levels = c("Outside called peaks", "Inside called peaks"))
+# 
+# ggplot(temp_numm_df) + 
+#     geom_bar(aes(x = method, y = size, fill = Region), color = "black", stat = "identity") + 
+#     scale_fill_manual(values = c("#f7c707", "#3c8790"), labels = c("Outside \ncalled peaks", "Inside \ncalled peaks")) + 
+#     xlab("Method") + 
+#     # ylab("Size (Mb)") +
+#     ylab("Number of circuits") +
+#     theme_minimal() + 
+#     theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1, vjust = 1), 
+#           axis.title.x = element_blank(),
+#           axis.title.y = element_text(size = 14),
+#           legend.title = element_text(size = 14), 
+#           legend.text = element_text(size = 14),
+#           legend.spacing.y = unit(10, "pt"),
+#           legend.margin = margin(t = 20, b = 20)) + 
+#     guides(fill = guide_legend(byrow = TRUE))
+# # ggsave(file.path("../eval_trios/10X_pbmc/Size.pdf"), width = 4, height = 5)
+# # ggsave(file.path("../eval_trios/10X_pbmc/Size.png"), width = 4, height = 5)
+```
+
+
+
+## Recovery of true regions
+
+```{r}
+# Use minimum p value as the p value for a region
+
+# tripod_gene_peak_df <- aggregate(pval ~ gene + peak, data = tripod_df, FUN = min)
+# colnames(tripod_gene_peak_df)[colnames(tripod_gene_peak_df) == "pval"] <- "p_val"
+
+tripod_gene_peak_df <- tripod_df[, list(p_val = min(pval)), by = list(gene, peak)]
+
+tripod_gene_peak_df$inpeak <- T
+```
+
+```{r}
+# # Use minimum p value as the p value for a region
+# crema_sites_all_df <- aggregate(p_val ~ gene + site + inpeak + overlapped_peak, data = crema_gene_tf_site_df_all, FUN = min)
+
+# Combine the peak and sites -----
+# Unify the site and overlapped peak under the same name peak
+# When there's an overlapping peak, use the peak
+# When there's no overlapping peak, use the site
+
+# crema_sitespeaks_all_df <- aggregate(p_val ~ gene + peak + inpeak, data = crema_gene_tf_sitespeaks_df, FUN = min)
+
+crema_sitespeaks_all_df <- crema_gene_tf_sitespeaks_df[, list(p_val = min(p_val)), by = list(gene, peak, inpeak)]
+
+# Extend the site -----
+# Extend the CREMA site (non peak) as a 50bp windows for the evaluation on overlapping with true regions
+temp <- GRangesToString(Extend_Granges(StringToGRanges(crema_sitespeaks_all_df$peak), upstream = 25, downstream = 25, from.midpoint = T))
+crema_sitespeaks_all_df$peak <- ifelse(crema_sitespeaks_all_df$inpeak, yes = crema_sitespeaks_all_df$peak, no = temp)
+```
+
+```{r}
+predictions_test_list <- list(Tripod = tripod_gene_peak_df,
+                              CREMA = crema_sitespeaks_all_df)
+targets_intersect <- Reduce(intersect, lapply(predictions_test_list, function(x){x$gene}))
+print(length(targets_intersect))
+```
+
+```{r}
+temp_predictions_df_list <- list()
+temp_predictions_gr_list <- list()
+
+for (temp_method in names(predictions_test_list)){
+    
+        temp_list_df <- predictions_test_list[[temp_method]]
+        
+        # Add FDR
+        temp_list_df$p_val_adj <- p.adjust(temp_list_df$p_val, method = "fdr")
+        
+        # Add gene-wise FDR
+        temp_list_df <- split(temp_list_df, f = temp_list_df$gene)
+        temp_func <- function(x){
+            x$p_val_adj_genewise <- p.adjust(x$p_val, method = "fdr")
+            return(x)
+        }
+        temp_list_df <- do.call("rbind", mclapply(temp_list_df, temp_func, mc.cores = 40))
+        
+        temp_list_gr <- StringToGRanges(temp_list_df$peak)
+        temp_list_gr <- split(x = temp_list_gr, f = temp_list_df$gene)
+        
+        temp_predictions_df_list[[temp_method]] <- temp_list_df
+        temp_predictions_gr_list[[temp_method]] <- temp_list_gr
+}
+```
+
+```{r}
+data_multi_subsetgene <- CreateSeuratObject(counts = exp_mtx[targets_intersect, ])
+
+# limit to variable genes
+data_multi_subsetgene <- FindVariableFeatures(data_multi_subsetgene, assay = "RNA", nfeatures = 1000, verbose = F)
+genes_test <- VariableFeatures(data_multi_subsetgene)
+
+# genes_test <- names(crema_regions)
+print(length(intersect(targets_intersect, genes_test)))
+```
+
+```{r}
+# Precision and recall at different threshold
+
+eval_databases_list <- c(enhancer_db_list, gtex_db_list[2:4])
+# eval_databases_list <- c(enhancer_db_list)
+
+eval_results_list <- list()
+
+
+for (eval_db_name in names(eval_databases_list)){
+    
+    # evaluation gene-site dataset
+    print(eval_db_name)
+    eval_db_gene_var_list_gr <- eval_databases_list[[eval_db_name]]
+    eval_db_gene_var_list_gr <- eval_db_gene_var_list_gr[intersect(targets_intersect,  names(eval_db_gene_var_list_gr))]
+    eval_db_gene_var_list_gr <- eval_db_gene_var_list_gr[sapply(eval_db_gene_var_list_gr, length) > 0]
+    
+    # convert evaluation GRanges to Strings
+    eval_db_gene_var_list <- lapply(eval_db_gene_var_list_gr, GRangesToString)
+    
+    # list of genes to evaluate on
+    temp_targets <- names(eval_db_gene_var_list)
+    
+    
+    # Annotate the peaks as true or false =====
+    predictions_peaks_eval_df_list <- list()
+    
+    for (temp_method in names(predictions_test_list)){
+        
+        # Prediction of gene-region relations
+        print(temp_method)
+        
+        temp_list_df <- temp_predictions_df_list[[temp_method]]
+        temp_list_gr <- temp_predictions_gr_list[[temp_method]]
+        
+        # temp_list_df <- predictions_test_list[[temp_method]]
+        # temp_list_df$p_val_adj <- p.adjust(temp_list_df$p_val, method = "fdr")
+        # temp_list_gr <- StringToGRanges(temp_list_df$peak)
+        # temp_list_gr <- split(x = temp_list_gr, f = temp_list_df$gene)
+        
+        # For each gene, find the true peaks
+        temp_func <- function(x){
+            temp_overlap <- findOverlaps(temp_list_gr[[x]], eval_db_gene_var_list_gr[[x]],
+                                         minoverlap = min(ceiling(min(width(temp_list_gr[[x]]))/3),
+                                                          ceiling(min(width(eval_db_gene_var_list_gr[[x]]))/3)))
+            if(length(temp_overlap) == 0){
+                return(data.frame())
+            }
+            return(data.frame(gene = x,
+                              peak = GRangesToString(temp_list_gr[[x]])[temp_overlap@from],
+                              recovered_region = GRangesToString(eval_db_gene_var_list_gr[[x]])[temp_overlap@to]))
+        }
+        temp_list_overlap_df <- mclapply(temp_targets, temp_func, mc.cores = 40)
+        temp_list_overlap_df <- do.call("rbind", temp_list_overlap_df)
+        temp_list_overlap_df$true <- T
+        
+        temp_list_df$id <- paste0(temp_list_df$gene, "_", temp_list_df$peak)
+        temp_list_overlap_df$id <- paste0(temp_list_overlap_df$gene, "_", temp_list_overlap_df$peak)
+        
+        temp_list_df <- merge(temp_list_df, temp_list_overlap_df[, c("id", "true", "recovered_region")], by = "id", all.x = T)
+        temp_list_df$true <- ifelse(!is.na(temp_list_df$true), yes = TRUE, no = FALSE)
+        
+        temp_list_df <- temp_list_df[temp_list_df$gene %in% temp_targets, ]
+        
+        predictions_peaks_eval_df_list[[temp_method]] <- temp_list_df
+    }
+    
+    eval_results_list[[eval_db_name]] <- list(predictions_peaks_eval_df_list = predictions_peaks_eval_df_list)
+    
+}
+
+saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_overlappedTrueRegions_site0_reduce.rds")
+# saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_overlappedTrueRegions_site50_reduce.rds")
+
+# saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_overlappedTrueRegions_site50.rds")
+
+eval_results_list <- readRDS("../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_overlappedTrueRegions_site50_reduce.rds")
+
+
+eval_databases_list <- c(enhancer_db_list, gtex_db_list[2:4])
+
+
+# Calculate precision and recall at different FDR cutoffs
+for (eval_db_name in names(eval_databases_list)){
+    
+    # evaluation gene-site dataset
+    print(eval_db_name)
+    eval_db_gene_var_list_gr <- eval_databases_list[[eval_db_name]]
+    eval_db_gene_var_list_gr <- eval_db_gene_var_list_gr[intersect(targets_intersect, names(eval_db_gene_var_list_gr))]
+    eval_db_gene_var_list_gr <- eval_db_gene_var_list_gr[sapply(eval_db_gene_var_list_gr, length) > 0]
+    
+    # convert evaluation GRanges to Strings
+    eval_db_gene_var_list <- lapply(eval_db_gene_var_list_gr, GRangesToString)
+    
+    # annotated results
+    predictions_peaks_eval_df_list <- eval_results_list[[eval_db_name]][["predictions_peaks_eval_df_list"]]
+    
+    # list of genes to evaluate on
+    temp_targets <- Reduce("intersect",
+                           list(names(eval_db_gene_var_list), targets_intersect, genes_test))
+    predictions_peaks_eval_df_list <- lapply(predictions_peaks_eval_df_list, function(x){x[x$gene %in% temp_targets, ]})
+    
+    # number of total true regions for each gene
+    eval_db_totalNum_df <- data.frame(gene = temp_targets,
+                                      row.names = temp_targets,
+                                      num = sapply(eval_db_gene_var_list[temp_targets], length))
+    print(nrow(eval_db_totalNum_df))
+    
+    # Select a few cutoffs for comparing precision and recall ==========
+    fdr_cutoffs <- 1*10^(seq(-1, -5, length.out = 30))
+    
+    
+    # Get the precision and recall at each cutoff ==========
+    precision_recall_cutoffs_df_list <- list()
+    enrichment_cutoffs_df_list <- list()
+    
+    for (temp_method in names(predictions_test_list)){
+        
+        temp_list_df <- predictions_peaks_eval_df_list[[temp_method]]
+        
+        # Background true and false
+        # remove gene-site pairs that map to more than one true region
+        temp_list_df_binary <- temp_list_df[!duplicated(temp_list_df$id), ]
+        num_background <- split(x = temp_list_df_binary$true, f = temp_list_df_binary$gene, drop = F)
+        num_background_true <- sapply(num_background, sum)
+        num_background_false <- sapply(num_background, length) - num_background_true
+        
+        for (fdr_cutoff in fdr_cutoffs){
+            
+            temp_group_name <- paste0(temp_method, "_", fdr_cutoff)
+            
+            called_gene_region_df <- temp_list_df[temp_list_df$p_val_adj < fdr_cutoff, ]
+            # called_gene_region_df <- temp_list_df[temp_list_df$p_val_adj_genewise < fdr_cutoff, ]
+            
+            # precision in peaks
+            temp_inpeak_df <- called_gene_region_df[called_gene_region_df$inpeak, ]
+            temp_inpeak_df <- temp_inpeak_df[!duplicated(temp_inpeak_df$id), ]
+            
+            # recall ratio in all sites
+            temp_recovered_df <- called_gene_region_df[called_gene_region_df$true, ]
+            temp_recovered_df <- temp_recovered_df[!duplicated(paste0(temp_recovered_df$gene, "_", temp_recovered_df$recovered_region)), ]
+            
+            # precision and recall across all genes
+            temp_pr_df <- data.frame(eval_db_name = eval_db_name,
+                                     method = temp_method,
+                                     fdr_cutoff = fdr_cutoff,
+                                     precision = sum(temp_inpeak_df$true) / nrow(temp_inpeak_df),
+                                     recall = nrow(temp_recovered_df) / sum(eval_db_totalNum_df$num))
+            
+            # precison by Gene
+            temp <- split(x = temp_inpeak_df$true, f = temp_inpeak_df$gene, drop = F)
+            temp <- sapply(temp, function(x){sum(x) / length(x)})
+            temp_precision_byGene_df <- data.frame(eval_db_name = eval_db_name,
+                                                   method = temp_method,
+                                                   fdr_cutoff = fdr_cutoff,
+                                                   gene = names(temp),
+                                                   precision = temp)
+            
+            # recall by Gene
+            temp <- split(x = temp_recovered_df$recovered_region, f = temp_recovered_df$gene, drop = F)
+            temp <- sapply(temp, length)
+            temp <- temp[eval_db_totalNum_df$gene]
+            temp[is.na(temp)] <- 0
+            temp <- temp / eval_db_totalNum_df$num
+            temp_recall_byGene_df <- data.frame(eval_db_name = eval_db_name,
+                                                method = temp_method,
+                                                fdr_cutoff = fdr_cutoff,
+                                                gene = eval_db_totalNum_df$gene,
+                                                recall = temp)
+            
+            precision_recall_cutoffs_df_list[["temp_pr_df"]][[temp_group_name]] <- temp_pr_df
+            precision_recall_cutoffs_df_list[["temp_precision_byGene_df"]][[temp_group_name]] <- temp_precision_byGene_df
+            precision_recall_cutoffs_df_list[["temp_recall_byGene_df"]][[temp_group_name]] <- temp_recall_byGene_df
+            
+            
+            # enrichment
+            temp <- split(x = temp_inpeak_df$true, f = temp_inpeak_df$gene, drop = F)
+            enrichment_byGene_df <- data.frame(eval_db_name = eval_db_name,
+                                                    method = temp_method,
+                                                    fdr_cutoff = fdr_cutoff,
+                                                    gene_name = names(temp),
+                                                    num = sapply(temp, length),
+                                                    num_overlap = sapply(temp, sum),
+                                                    num_background_true = num_background_true[names(temp)],
+                                                    num_background_false = num_background_false[names(temp)])
+            enrichment_byGene_df$p_val <- phyper(q = enrichment_byGene_df$num_overlap, 
+                                     m = enrichment_byGene_df$num_background_true, 
+                                     n = enrichment_byGene_df$num_background_false, 
+                                     k = enrichment_byGene_df$num, lower.tail = F)
+            
+            enrichment_cutoffs_df_list[["enrichment_byGene_df"]][[temp_group_name]] <- enrichment_byGene_df
+
+        }
+    }
+    
+    precision_recall_cutoffs_df_list <- lapply(precision_recall_cutoffs_df_list, function(x){do.call("rbind", x)})
+    enrichment_cutoffs_df_list <- lapply(enrichment_cutoffs_df_list, function(x){do.call("rbind", x)})
+    
+    eval_results_list[[eval_db_name]][["precision_recall_cutoffs_df_list"]] <- precision_recall_cutoffs_df_list
+    eval_results_list[[eval_db_name]][["enrichment_cutoffs_df_list"]] <- enrichment_cutoffs_df_list
+    
+}
+
+# saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_ManualCutoffs.rds")
+# # eval_results_list <- readRDS("../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_ManualCutoffs.rds")
+
+# saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_ManualCutoffs_variableGenes.rds")
+# eval_results_list <- readRDS("../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_ManualCutoffs_variableGenes.rds")
+```
+
+```{r}
+temp_func <- function(x){
+    temp_df <- x$precision_recall_cutoffs_df_list$temp_pr_df
+    
+    temp_df <- temp_df[order(temp_df$eval_db_name, temp_df$method, temp_df$precision), ]
+    
+    # temp_df <- temp_df[temp_df$fdr_cutoff >= 1e-4 & temp_df$fdr_cutoff <= 1e-1, ]
+    
+    precision_min <- max(sapply(split(x = temp_df$precision, f = temp_df$method), min))
+    precision_max <- min(sapply(split(x = temp_df$precision, f = temp_df$method), max))
+    temp_df <- temp_df[temp_df$precision >= precision_min & temp_df$precision <= precision_max, ]
+    return(temp_df)
+}
+temp_pr_df <- do.call("rbind", lapply(eval_results_list, temp_func))
+
+ggplot(temp_pr_df) + 
+    geom_line(aes(x = precision, y = recall, color = method), size = 2) + 
+    facet_wrap("eval_db_name", scales = "free") + 
+    xlab("Precision of regulatory peak prediction") + 
+    ylab("Proportion of true regulatory regions recovered") + 
+    theme_minimal()
+ggsave(file.path("../eval_regions/10X_pbmc/", paste0("Regions_PR_crema-tripod_", "all", ".pdf")))
+
+
+for (eval_db_name in unique(temp_pr_df$eval_db_name)){
+    temp_df <- temp_pr_df[temp_pr_df$eval_db_name == eval_db_name, ]
+
+    p1 <- ggplot(temp_df) +
+        geom_line(aes(x = precision, y = recall, color = method), size = 1.5) +
+        xlab("Precision of regulatory peak prediction") +
+        ylab("Proportion of true regulatory regions recovered") +
+        ggtitle(eval_db_name) +
+        theme_minimal() +
+        theme(axis.title.x = element_text(size = 16),
+              axis.title.y = element_text(size = 16),
+              legend.title = element_text(size = 16),
+              legend.text = element_text(size = 16))
+    print(p1)
+    ggsave(file.path("../eval_regions/10X_pbmc/", paste0("Regions_PR_crema-tripod_", eval_db_name, ".pdf")),
+           p1, width = 5, height = 5)
+}
+```
+
+```{r}
+
+```
+
+
+
+
+

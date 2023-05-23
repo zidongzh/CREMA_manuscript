@@ -1,0 +1,424 @@
+```{r}
+library(Seurat)
+library(Signac) # Using the development version
+
+library(GenomicRanges)
+
+library(ggplot2)
+
+library(parallel)
+```
+
+```{r}
+devtools::load_all("../CREMA/")
+```
+
+
+# Human PBMC
+
+## Data
+
+```{r}
+dataset_name <- "multiome"
+
+data_human <- readRDS(file.path("../data_seurat_object/10X_pbmc", paste0(dataset_name, ".rds")))
+
+frag_object_human_original <- CreateFragmentObject(path = file.path("../data/10X_pbmc/", dataset_name,
+                                                              "pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz"),
+                                             cells = colnames(data_human))
+
+frag_object_human_inserts <- CreateFragmentObject(path = file.path("../data/10X_pbmc", dataset_name,
+                                                             "pbmc_granulocyte_sorted_10k_atac_inserts.tsv.gz"), 
+                                            cells = colnames(data_human))
+```
+
+## CREMA results
+
+```{r}
+# All sites -----
+site_extension <- 200
+regression_method <- "ols"
+motif_database <- "jaspar"
+
+smooth_k <- 0
+smooth_name <- ifelse(smooth_k == 0, yes = "", no = paste0("smooth-", smooth_k, "_"))
+
+output_dir <- file.path("../linear_model_results/", paste0("10X_pbmc-proximal", "-site", site_extension, "_", motif_database))
+lm.models_tf_ATACweighted_highres <- readRDS(file.path(output_dir,
+                                                       paste0("crema-", regression_method, "-SCTcounts",
+                                                              "_allTFs-allGenes-ATACweighted-highres_",
+                                                              smooth_name,
+                                                              dataset_name, ".rds")))
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[sapply(lm.models_tf_ATACweighted_highres, length) > 1]
+
+# lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[intersect(names(lm.models_tf_ATACweighted_highres),
+#                                                                                  genes_test)]
+
+temp_p <- unlist(lapply(lm.models_tf_ATACweighted_highres, function(x){x$p}))
+p_val_cutoff <- max(temp_p[p.adjust(temp_p, method = "fdr") < 1e-4])
+# p_val_cutoff <- 1e-8
+
+# Data frame of gene - tf - site =====
+temp_func <- function(x){
+    temp_p <- lm.models_tf_ATACweighted_highres[[x]]$p
+    temp_t <- lm.models_tf_ATACweighted_highres[[x]]$t
+    temp_ind <- !is.na(temp_p) & temp_p < p_val_cutoff
+    if(sum(temp_ind) > 0){
+        return(data.frame(gene = x,
+                          site = names(temp_p)[temp_ind],
+                          p_val = temp_p[temp_ind]))
+    }else{
+        return(data.frame())
+    }
+}
+crema_sites_select_df <- do.call("rbind", mclapply(names(lm.models_tf_ATACweighted_highres), temp_func, mc.cores = 40))
+
+temp <- strsplit(crema_sites_select_df$site, split = "_")
+crema_sites_select_df$TF <- sapply(temp, function(x){x[1]})
+crema_sites_select_df$site <- sapply(temp, function(x){x[2]})
+
+print(max(crema_sites_select_df$p_val))
+print(nrow(crema_sites_select_df))
+
+
+# Convert to peak space -----
+min_overlap_for_peak <- 0
+
+sites_all_str <- unique(crema_sites_select_df$site)
+sites_all_gr <- StringToGRanges(sites_all_str)
+
+peaks_all_gr <- data_human[["ATAC"]]@ranges
+peaks_all_str <- GRangesToString(peaks_all_gr)
+
+temp_overlap <- findOverlaps(sites_all_gr, peaks_all_gr, minoverlap = min_overlap_for_peak)
+temp_overlap_df <- data.frame(site = sites_all_str[temp_overlap@from],
+                              overlapped_peak = peaks_all_str[temp_overlap@to])
+
+crema_sites_select_df <- merge(crema_sites_select_df, temp_overlap_df, by = "site", all.x = T, sort = F)
+crema_sites_select_df$inpeak <- !is.na(crema_sites_select_df$overlapped_peak)
+```
+
+```{r}
+crema_results_human <- crema_sites_select_df
+```
+
+
+## Dimension Reduction
+
+```{r}
+DefaultAssay(data_human) <- "SCT"
+data_human <- FindVariableFeatures(data_human, nfeatures = 3000)
+```
+
+```{r}
+site_extension <- 200
+
+# Non peak sites
+sites_nonpeak <- unique(crema_results_human$site[!crema_results_human$inpeak & crema_results_human$gene %in% VariableFeatures(data_human)])
+print(length(sites_nonpeak))
+
+sites_nonpeak_gr <- reduce(Extend_Granges(StringToGRanges(sites_nonpeak), upstream = site_extension, downstream = site_extension))
+print(length(sites_nonpeak_gr))
+hist(width(sites_nonpeak_gr))
+
+# Split very wide regions into smaller regions
+max_width <- 2000
+sites_nonpeak_gr <- tile(sites_nonpeak_gr, width = max_width)
+sites_nonpeak_gr <- unlist(sites_nonpeak_gr)
+print(length(sites_nonpeak_gr))
+hist(width(sites_nonpeak_gr))
+
+
+# Accessiiblity of nonpeak sites
+# sites_access_mtx_nonpeak <- FeatureMatrix(fragments = frag_object_human_original,
+#                                           features = sites_nonpeak_gr,
+#                                           cells = colnames(data_multi),
+#                                           process_n = 2000000, verbose = F)
+
+sites_select_list <- list()
+batchSize <- 10000
+for (i in seq(1, ceiling(length(sites_nonpeak_gr)/batchSize))){
+    sites_select_list[[i]] <- sites_nonpeak_gr[(batchSize*(i-1)+1) : min(batchSize*i, length(sites_nonpeak_gr))]
+}
+sites_access_mtx_list <- mclapply(sites_select_list,
+                                  function(x){FeatureMatrix(fragments = frag_object_human_original,
+                                                            features = x,
+                                                            cells = colnames(data_human),
+                                                            process_n = 2000000,
+                                                            verbose = F)},
+                                  mc.cores = length(sites_select_list))
+sites_access_mtx_nonpeak <- do.call("rbind", sites_access_mtx_list)
+```
+
+```{r}
+# clean cell type annotations
+# Use major cell types
+
+data_human$celltype_annotation_fine <- data_human$predicted.id
+
+celltype_mapping <-  list(
+"CD4 Naive" = "Naive T",
+"CD8 Naive" = "Naive T",
+"CD4 TCM" = "Central memory T",
+"CD8 TCM" = "Central memory T",
+"CD4 TEM" = "Effector memory T",
+"CD8 TEM" = "Effector memory T",
+"CD4 Proliferating" = "Proliferating T",
+"CD8 Proliferating" = "Proliferating T",
+"cDC1" = "cDC",
+"cDC2" = "cDC",
+"pDC" = "pDC",
+"NK" = "NK",
+"NK Proliferating" = "NK",
+"NK_CD56bright" = "NK",
+"CD14 Mono" = "Mono",
+"CD16 Mono" = "Mono"
+)
+celltype_mapping <- unlist(celltype_mapping)
+
+data_human$celltype_annotation_coarse <- as.character(data_human$celltype_annotation_fine)
+temp_ind <- data_human$celltype_annotation_fine %in% names(celltype_mapping)
+data_human$celltype_annotation_coarse[temp_ind] <- celltype_mapping[data_human$celltype_annotation_fine[temp_ind]]
+
+print(table(data_human$celltype_annotation_coarse))
+print(table(data_human$celltype_annotation_fine))
+```
+
+```{r}
+# Dimension reduction
+data_human_nonpeak <- CreateChromatinAssay(counts = sites_access_mtx_nonpeak,
+                                           fragments = frag_object_human_original,
+                                           annotation = data_human[["ATAC"]]@annotation)
+
+data_human_nonpeak <- CreateSeuratObject(counts = data_human_nonpeak,
+                                         assay = "sites",
+                                         project = "ATAC",
+                                         meta.data = data_human@meta.data)
+
+
+# Selected major cell types:
+data_human_nonpeak <- subset(data_human_nonpeak, 
+                             subset = celltype_annotation_coarse %in% c("B intermediate", "B memory", "B naive", 
+                                                                        "Naive T", "Central memory T", "Effector memory T", "NK", "Treg", 
+                                                                        "gdT", "MAIT", "Mono", "cDC", "pDC"))
+
+
+# Dimension reduction
+
+DefaultAssay(data_human_nonpeak) <- "sites"
+
+data_human_nonpeak <- FindTopFeatures(data_human_nonpeak, min.cutoff = 5, verbose = F)
+
+data_human_nonpeak <- RunTFIDF(data_human_nonpeak, verbose = F)
+
+# VariableFeatures(data_human_nonpeak) <- row.names(data_human_nonpeak)
+# data_human_nonpeak <- FindVariableFeatures(data_human_nonpeak, nfeatures = 30000)
+
+print(length(VariableFeatures(data_human_nonpeak)))
+
+data_human_nonpeak <- RunSVD(data_human_nonpeak, verbose = F)
+
+data_human_nonpeak <- RunUMAP(data_human_nonpeak, reduction = "lsi", dims = 2:30, reduction.name = "umap", reduction.key = "sitesUMAP_", verbose = F)
+
+
+p1 <- DimPlot(data_human_nonpeak, reduction = "umap", group.by = "celltype_annotation_coarse", label = T, repel = T) + NoLegend() + ggtitle("UMAP by sites out of peaks")
+print(p1)
+
+ggsave(file.path("../application/10X_pbmc/UMAP_sites-nonpeak.png"), p1, width = 6, height = 5)
+```
+
+
+# Mouse pituitary
+
+## Data
+
+```{r}
+sample_id <- "WT22"
+dataset_name <- sample_id
+```
+
+```{r}
+data_mouse <- readRDS(file.path("../data_seurat_object/pituitary_wt/",
+                                paste0("MM-", sample_id, "_labelTransferred_peaksReCalled.rds")))
+
+frag_object_mouse_original <- CreateFragmentObject(path = file.path("../data/pituitary_wt/", paste0("MM-", sample_id), "atac_fragments.tsv.gz"),
+                                                   cells = colnames(data_mouse))
+
+frag_object_mouse_inserts <- CreateFragmentObject(path = file.path("../data/pituitary_wt/", paste0("MM-", sample_id), "atac_inserts.tsv.gz"), 
+                                                  cells = colnames(data_mouse))
+```
+
+```{r}
+data_mouse <- subset(data_mouse, 
+                     cells = colnames(data_mouse)[data_mouse$cell.ident.transferred %in% setdiff(data_mouse$cell.ident.transferred, c("Debris", "S+L doublets"))])
+```
+
+
+## CREMA results
+
+```{r}
+# CREMA results =========
+site_extension <- 200
+regression_method <- "ols"
+motif_database <- "cisbp"
+
+smooth_k <- 0
+smooth_name <- ifelse(smooth_k == 0, yes = "", no = paste0("smooth-", smooth_k, "_"))
+
+output_dir <- file.path("../linear_model_results/", paste0("pituitary_wt-all-proximal", "-site", site_extension, "_", motif_database))
+lm.models_tf_ATACweighted_highres <- readRDS(file.path(output_dir,
+                                                       paste0("crema-", regression_method, "-", "SCTcounts",
+                                                              "_allTFs-allGenes-ATACweighted-highres_",
+                                                              smooth_name,
+                                                              dataset_name, ".rds")))
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[sapply(lm.models_tf_ATACweighted_highres, length) > 1]
+
+temp_p <- unlist(lapply(lm.models_tf_ATACweighted_highres, function(x){x$p}))
+p_val_cutoff <- max(temp_p[p.adjust(temp_p, method = "fdr") < 1e-4])
+
+temp_func <- function(x){
+    temp_p <- lm.models_tf_ATACweighted_highres[[x]]$p
+    temp_t <- lm.models_tf_ATACweighted_highres[[x]]$t
+    temp_ind <- !is.na(temp_p) & temp_p < p_val_cutoff
+    if(sum(temp_ind) > 0){
+        return(data.frame(gene = x,
+                          site = names(temp_p)[temp_ind],
+                          p_val = temp_p[temp_ind]))
+    }else{
+        return(data.frame())
+    }
+}
+crema_sites_select_df <- do.call("rbind", mclapply(names(lm.models_tf_ATACweighted_highres), temp_func, mc.cores = 40))
+print(nrow(crema_sites_select_df))
+
+temp <- strsplit(crema_sites_select_df$site, split = "_")
+crema_sites_select_df$TF <- sapply(temp, function(x){x[1]})
+crema_sites_select_df$site <- sapply(temp, function(x){x[2]})
+
+print(max(crema_sites_select_df$p_val))
+
+
+# Convert to peak space -----
+min_overlap_for_peak <- 0
+
+sites_all_str <- unique(crema_sites_select_df$site)
+sites_all_gr <- StringToGRanges(sites_all_str)
+
+peaks_all_gr <- data_mouse[["ATAC"]]@ranges
+peaks_all_str <- GRangesToString(peaks_all_gr)
+
+temp_overlap <- findOverlaps(sites_all_gr, peaks_all_gr, minoverlap = min_overlap_for_peak)
+temp_overlap_df <- data.frame(site = sites_all_str[temp_overlap@from],
+                              overlapped_peak = peaks_all_str[temp_overlap@to])
+
+crema_sites_select_df <- merge(crema_sites_select_df, temp_overlap_df, by = "site", all.x = T, sort = F)
+crema_sites_select_df$inpeak <- !is.na(crema_sites_select_df$overlapped_peak)
+```
+
+```{r}
+crema_results_mouse <- crema_sites_select_df
+```
+
+## Dimension Reduction
+
+```{r}
+data_mouse <- RunUMAP(data_mouse, reduction = "lsi", dims = 2:30, reduction.name = "umap_atac", verbose = F)
+DimPlot(data_mouse, reduction = "umap_atac", group.by = "cell.ident.transferred", label = T, repel = T)
+```
+
+```{r}
+DefaultAssay(data_mouse) <- "SCT"
+data_mouse <- FindVariableFeatures(data_mouse, nfeatures = 3000)
+```
+
+```{r}
+site_extension <- 200
+
+# Non peak sites
+# sites_nonpeak <- unique(crema_results_mouse$site[!crema_results_mouse$inpeak & crema_results_mouse$gene %in% VariableFeatures(data_mouse)])
+sites_nonpeak <- unique(crema_results_mouse$site[!crema_results_mouse$inpeak])
+print(length(sites_nonpeak))
+
+sites_nonpeak_gr <- reduce(Extend_Granges(StringToGRanges(sites_nonpeak), upstream = site_extension, downstream = site_extension))
+print(length(sites_nonpeak_gr))
+hist(width(sites_nonpeak_gr))
+
+# Split very wide regions into smaller regions
+max_width <- 2000
+sites_nonpeak_gr <- tile(sites_nonpeak_gr, width = max_width)
+sites_nonpeak_gr <- unlist(sites_nonpeak_gr)
+print(length(sites_nonpeak_gr))
+hist(width(sites_nonpeak_gr))
+
+
+# Accessiiblity of nonpeak sites
+# sites_access_mtx_nonpeak <- FeatureMatrix(fragments = frag_object_mouse_original,
+#                                           features = sites_nonpeak_gr,
+#                                           cells = colnames(data_multi),
+#                                           process_n = 2000000, verbose = F)
+
+sites_select_list <- list()
+batchSize <- 10000
+for (i in seq(1, ceiling(length(sites_nonpeak_gr)/batchSize))){
+    sites_select_list[[i]] <- sites_nonpeak_gr[(batchSize*(i-1)+1) : min(batchSize*i, length(sites_nonpeak_gr))]
+}
+sites_access_mtx_list <- mclapply(sites_select_list,
+                                  function(x){FeatureMatrix(fragments = frag_object_mouse_original,
+                                                            features = x,
+                                                            cells = colnames(data_mouse),
+                                                            process_n = 2000000,
+                                                            verbose = F)},
+                                  mc.cores = length(sites_select_list))
+sites_access_mtx_nonpeak <- do.call("rbind", sites_access_mtx_list)
+```
+
+```{r}
+annotations <- data_mouse[["ATAC"]]@annotation
+metadata <- data_mouse@meta.data
+metadata$celltype_annotation <- ifelse(metadata$cell.ident.transferred %in% c("Somatotropes 1", "Somatotropes 2"),
+                                       yes = "Somatotropes", no = metadata$cell.ident.transferred)
+
+data_mouse_nonpeak <- CreateChromatinAssay(counts = sites_access_mtx_nonpeak,
+                                       fragments = frag_object_mouse_original,
+                                       annotation = annotations)
+data_mouse_nonpeak <- CreateSeuratObject(counts = data_mouse_nonpeak,
+                                     assay = "regions",
+                                     project = "ATAC",
+                                     meta.data = metadata)
+
+# cell types to show
+data_mouse_nonpeak <- subset(data_mouse_nonpeak,
+                         cells = colnames(data_mouse_nonpeak)[!(data_mouse_nonpeak$celltype_annotation %in% c("Proliferating", "Endothelial", "Macrophages"))])
+
+
+# Dimension reduction
+DefaultAssay(data_mouse_nonpeak) <- "regions"
+
+data_mouse_nonpeak <- FindTopFeatures(data_mouse_nonpeak, min.cutoff = 5, verbose = F)
+
+data_mouse_nonpeak <- RunTFIDF(data_mouse_nonpeak, verbose = F)
+
+# VariableFeatures(data_mouse_nonpeak) <- row.names(data_mouse_nonpeak)
+# data_mouse_nonpeak <- FindVariableFeatures(data_mouse_nonpeak, nfeatures = 30000)
+
+print(length(VariableFeatures(data_mouse_nonpeak)))
+
+data_mouse_nonpeak <- RunSVD(data_mouse_nonpeak, verbose = F)
+
+data_mouse_nonpeak <- RunUMAP(data_mouse_nonpeak, reduction = "lsi", reduction.name = "umap", dims = 2:30, verbose = F)
+
+
+p1 <- DimPlot(data_mouse_nonpeak, reduction = "umap", group.by = "celltype_annotation", label = T, repel = T) + NoLegend() + ggtitle("UMAP using CREMA sites")
+print(p1)
+ggsave(file.path("../application/pituitary_wt//UMAP_sites-nonpeak.png"), p1, width = 6, height = 5)
+```
+
+
+# sessionInfo
+
+```{r}
+sessionInfo()
+```
+
