@@ -2,7 +2,7 @@
 
 This repository contains the source code to generate the analysis shown this manuscript:
 
-*Peak-agnostic high-resolution cis-regulatory circuitry mapping using single cell multiome data*
+**Peak-agnostic high-resolution cis-regulatory circuitry mapping using single cell multiome data**
 
 Zidong Zhang, Frederique Ruf-Zamojski, Michel Zamojski, Daniel J. Bernard, Xi Chen, Olga G. Troyanskaya, Stuart C. Sealfon
 
