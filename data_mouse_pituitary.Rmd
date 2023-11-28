@@ -1,0 +1,188 @@
+---
+title: CREMA on pituitary
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+
+```{r}
+library(Seurat)
+library(Signac)
+
+library(TFBSTools)
+library(motifmatchr)
+
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+
+library(Matrix)
+library(matrixStats)
+
+library(parallel)
+
+library(DESeq2)
+
+library(data.table)
+
+library(ggplot2)
+```
+
+```{r}
+devtools::load_all("../CREMA/")
+```
+
+# Data
+
+```{r}
+# get gene annotations for hg38
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79, verbose = F)
+seqlevelsStyle(annotation) <- "UCSC"
+```
+
+```{r}
+sample_id <- "WT22"
+dataset_name <- sample_id
+```
+
+```{r}
+# load the RNA and ATAC data
+counts <- Read10X_h5("../data/pituitary_wt/MM-WT22/filtered_feature_bc_matrix.h5")
+fragpath <- "../data/pituitary_wt/MM-WT22/atac_fragments.tsv.gz"
+
+# create a Seurat object containing the RNA adata
+data_multi <- CreateSeuratObject(counts = counts$`Gene Expression`,
+                                 assay = "RNA")
+
+# create ATAC assay and add it to the object
+data_multi[["ATAC"]] <- CreateChromatinAssay(counts = counts$Peaks,
+                                             sep = c(":", "-"),
+                                             fragments = fragpath,
+                                             annotation = annotation)
+```
+
+## QC
+
+```{r}
+DefaultAssay(data_multi) <- "ATAC"
+data_multi <- NucleosomeSignal(data_multi)
+data_multi <- TSSEnrichment(data_multi)
+```
+
+```{r}
+VlnPlot(data_multi,
+        features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal"),
+        ncol = 4,
+        pt.size = 0)
+```
+
+```{r}
+data_multi <- subset(data_multi,
+                     subset = nCount_ATAC < 100000 &
+                         nCount_RNA < 25000 &
+                         nCount_ATAC > 1000 &
+                         nCount_RNA > 1000 &
+                         nucleosome_signal < 2 &
+                         TSS.enrichment > 1
+)
+```
+
+## Peak Calling
+
+```{r}
+# call peaks using MACS2
+peaks <- CallPeaks(data_multi, macs2.path = "/home/zidongz/anaconda3/envs/macs/bin/macs2",
+                   assay = "ATAC", effective.genome.size = 1.87e9)
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_mm10, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(data_multi),
+  features = peaks,
+  cells = colnames(data_multi)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+data_multi[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+## SCTransform
+
+```{r}
+DefaultAssay(data_multi) <- "RNA"
+data_multi <- SCTransform(data_multi)
+data_multi <- RunPCA(data_multi)
+
+DefaultAssay(data_multi) <- "peaks"
+data_multi <- FindTopFeatures(data_multi, min.cutoff = 5)
+data_multi <- RunTFIDF(data_multi)
+data_multi <- RunSVD(data_multi)
+```
+
+
+# Label Transfer
+
+```{r}
+data_ref_list <- list()
+for (x in c("MM1", "MM2", "MM3")){
+    temp <- readRDS(file.path("../../pituitary/RNA-seq/data_seurat_object/", paste0("IntronPit", x,".rds")))
+    temp$celltype_annot <- Idents(temp)
+    print(table(temp$celltype_annot))
+    data_ref_list[[x]] <- temp
+}
+```
+
+```{r}
+data_ref_rna_all <- merge(x = data_ref_list[[1]], y = data_ref_list[2:3], add.cell.ids = c("MM1", "MM2", "MM3"))
+```
+
+```{r}
+data_ref_rna_all <- FindVariableFeatures(data_ref_rna_all)
+data_multi <- FindVariableFeatures(data_multi, assay = "RNA")
+```
+
+```{r}
+data_ref_rna_all <- SCTransform(data_ref_rna_all)
+data_multi <- SCTransform(data_multi)
+```
+
+```{r}
+# FindTransferAnchor workflow
+transfer.anchors <- FindTransferAnchors(reference = data_ref_rna_all,
+                                        query = data_multi,
+                                        reference.assay = "SCT",
+                                        query.assay = "SCT",
+                                        normalization.method = "SCT",
+                                        reduction = "pcaproject",
+                                        verbose = F)
+
+
+# Label Transfer
+celltype.predictions <- TransferData(anchorset = transfer.anchors, 
+                                     refdata = data_ref_rna_all$celltype_annot,
+                                     verbose = F)
+
+print(table(celltype.predictions$predicted.id))
+```
+
+```{r}
+# rename the predicted.id metadata
+data_multi <- AddMetaData(data_multi, 
+                          metadata = celltype.predictions[, c("predicted.id",
+                                                              "prediction.score.max")])
+
+data_multi$cell.ident.transferred <- factor(data_multi$predicted.id, 
+                                            levels = sort(unique(data_ref_rna_all$celltype_annot)))
+```
+

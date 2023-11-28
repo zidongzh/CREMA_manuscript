@@ -1,0 +1,208 @@
+---
+title: Process the 10X pbmc multiome example data
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+
+```{r}
+library(Seurat)
+library(Signac) # Using the development version
+
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+# Data
+
+Follow the Signac 10X multiome vignettes
+
+We used the sn multiome data processed by CellRanger v1.0.0
+https://www.10xgenomics.com/resources/datasets/pbmc-from-a-healthy-donor-granulocytes-removed-through-cell-sorting-10-k-1-standard-1-0-0
+
+https://www.10xgenomics.com/resources/datasets/pbmc-from-a-healthy-donor-granulocytes-removed-through-cell-sorting-10-k-1-standard-2-0-0
+
+```{r}
+# get gene annotations for hg38
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86, verbose = F)
+seqlevelsStyle(annotation) <- "UCSC"
+```
+
+
+```{r}
+# load the RNA and ATAC data
+counts <- Read10X_h5("../data/10X_pbmc/multiome/pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5")
+fragpath <- "../data/10X_pbmc/multiome/pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz"
+
+# create a Seurat object containing the RNA adata
+pbmc <- CreateSeuratObject(
+  counts = counts$`Gene Expression`,
+  assay = "RNA"
+)
+
+# create ATAC assay and add it to the object
+pbmc[["ATAC"]] <- CreateChromatinAssay(
+  counts = counts$Peaks,
+  sep = c(":", "-"),
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+## QC
+
+```{r}
+DefaultAssay(pbmc) <- "RNA"
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+VlnPlot(pbmc, features = c("nCount_RNA", "percent.mt"), ncol = 2)
+```
+
+```{r}
+DefaultAssay(pbmc) <- "ATAC"
+pbmc <- NucleosomeSignal(pbmc)
+pbmc <- TSSEnrichment(pbmc)
+```
+
+```{r}
+VlnPlot(
+  object = pbmc,
+  features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal"),
+  ncol = 4,
+  pt.size = 0
+)
+```
+
+```{r}
+pbmc <- subset(
+  x = pbmc,
+  subset = nCount_ATAC < 100000 &
+    nCount_RNA < 25000 &
+    nCount_ATAC > 1000 &
+    nCount_RNA > 1000 &
+    nucleosome_signal < 2 &
+    TSS.enrichment > 1
+)
+```
+
+## Peak calling
+
+```{r}
+# call peaks using MACS2
+peaks <- CallPeaks(pbmc, macs2.path = "/home/zidongz/anaconda3/envs/macs/bin/macs2")
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(pbmc),
+  features = peaks,
+  cells = colnames(pbmc)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+pbmc[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+## Normalization
+
+```{r}
+DefaultAssay(pbmc) <- "RNA"
+pbmc <- SCTransform(pbmc)
+pbmc <- RunPCA(pbmc)
+
+DefaultAssay(pbmc) <- "peaks"
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 5)
+pbmc <- RunTFIDF(pbmc)
+pbmc <- RunSVD(pbmc)
+```
+
+## Annotate Cell types
+
+```{r}
+library(SeuratDisk)
+
+# load PBMC reference
+reference <- LoadH5Seurat("../data/10X_pbmc/pbmc_multimodal.h5seurat")
+
+DefaultAssay(pbmc) <- "SCT"
+
+# transfer cell type labels from reference to query
+transfer_anchors <- FindTransferAnchors(
+  reference = reference,
+  query = pbmc,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  recompute.residuals = FALSE,
+  dims = 1:50
+)
+
+predictions <- TransferData(
+  anchorset = transfer_anchors, 
+  refdata = reference$celltype.l2,
+  weight.reduction = pbmc[['pca']],
+  dims = 1:50
+)
+
+pbmc <- AddMetaData(
+  object = pbmc,
+  metadata = predictions
+)
+
+# set the cell identities to the cell type predictions
+Idents(pbmc) <- "predicted.id"
+
+# set a reasonable order for cell types to be displayed when plotting
+levels(pbmc) <- c("CD4 Naive", "CD4 TCM", "CD4 CTL", "CD4 TEM", "CD4 Proliferating",
+                  "CD8 Naive", "dnT",
+                 "CD8 TEM", "CD8 TCM", "CD8 Proliferating", "MAIT", "NK", "NK_CD56bright",
+                 "NK Proliferating", "gdT",
+                 "Treg", "B naive", "B intermediate", "B memory", "Plasmablast",
+                 "CD14 Mono", "CD16 Mono",
+                 "cDC1", "cDC2", "pDC", "HSPC", "Eryth", "ASDC", "ILC", "Platelet")
+```
+
+## Dimension
+
+```{r}
+# build a joint neighbor graph using both assays
+pbmc <- FindMultiModalNeighbors(
+  object = pbmc,
+  reduction.list = list("pca", "lsi"), 
+  dims.list = list(1:50, 2:40),
+  modality.weight.name = "RNA.weight",
+  verbose = TRUE
+)
+
+# build a joint UMAP visualization
+pbmc <- RunUMAP(
+  object = pbmc,
+  nn.name = "weighted.nn",
+  assay = "RNA",
+  verbose = TRUE
+)
+
+DimPlot(pbmc, label = TRUE, repel = TRUE, reduction = "umap") + NoLegend()
+```
+
+## Save
+
+```{r}
+saveRDS(pbmc, file.path("../data_seurat_object/10X_pbmc/", paste0("multiome.rds")))
+```
+
+# Session Info
+
+```{r}
+print(sessionInfo())
+```

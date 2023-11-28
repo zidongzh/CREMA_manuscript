@@ -1,0 +1,1210 @@
+---
+title: CREMA on pituitary
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+
+```{r}
+library(Seurat)
+library(Signac)
+
+library(TFBSTools)
+library(motifmatchr)
+
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+
+library(Matrix)
+library(matrixStats)
+
+library(parallel)
+
+library(DESeq2)
+
+library(data.table)
+
+library(ggplot2)
+```
+
+```{r}
+devtools::load_all("../CREMA/")
+```
+
+# Data
+
+```{r}
+sample_id <- "WT22"
+dataset_name <- sample_id
+```
+
+```{r}
+lm_data_use_rna <- list(assay ="SCT", slot = "counts")
+lm_data_use_atac <- list(assay ="ATAC", slot = "data")
+```
+
+```{r}
+data_multi <- readRDS(file.path("../data_seurat_object/pituitary_wt/",
+                                paste0("MM-", sample_id, "_labelTransferred_peaksReCalled.rds")))
+
+frag_object_fragments <- CreateFragmentObject(path = file.path("../data/pituitary_wt/", paste0("MM-", sample_id), "atac_fragments.tsv.gz"),
+                                              cells = colnames(data_multi))
+Fragments(data_multi[["ATAC"]]) <- NULL
+Fragments(data_multi[["ATAC"]]) <- frag_object_fragments
+
+frag_object_inserts <- CreateFragmentObject(path = file.path("../data/pituitary_wt/", paste0("MM-", sample_id), "atac_inserts.tsv.gz"), 
+                                            cells = colnames(data_multi))
+
+Fragments(data_multi[["peaks"]]) <- NULL
+Fragments(data_multi[["peaks"]]) <- frag_object_inserts
+
+DefaultAssay(data_multi) <- "SCT"
+print(table(data_multi$cell.ident.transferred))
+```
+
+```{r}
+cells_select <- colnames(data_multi)[data_multi$cell.ident.transferred %in% setdiff(data_multi$cell.ident.transferred, c("Debris", "S+L doublets"))]
+data_multi <- subset(data_multi, cells = cells_select)
+print(table(data_multi$cell.ident.transferred))
+
+# DimPlot(data_multi, reduction = "umap", group.by = "cell.ident.transferred")
+```
+
+```{r}
+DimPlot(data_multi, reduction = "umap", group.by = "cell.ident.transferred", label = T, repel = T) + NoLegend()
+```
+
+## gene coords
+
+```{r}
+# ================
+# gene annotation
+# ================
+print("using gene annotation from EnsDb.Mmusculus.v79")
+
+# extract gene coordinates from Ensembl, and ensure name formatting is consistent with  Seurat object 
+# gene.coords <- genes(EnsDb.Mmusculus.v79, filter = ~ gene_biotype == "protein_coding")
+gene.coords <- ensembldb::genes(EnsDb.Mmusculus.v79)
+# seqlevelsStyle(gene.coords) <- 'UCSC'
+# gene.coords <- gene.coords[gene.coords$gene_biotype == "protein_coding"]
+genebody.coords <- keepStandardChromosomes(gene.coords, species = "Mus_musculus", pruning.mode = 'coarse')
+
+# add TSS
+genebody.coords$TSS <- ifelse(test = (strand(genebody.coords) == "+" | strand(genebody.coords) == "*"),
+                              yes = start(genebody.coords),
+                              no = end(genebody.coords))
+
+# change style of seqnames
+seqlevels(genebody.coords) <- paste0("chr", seqlevels(genebody.coords))
+```
+
+## motifs
+
+```{r}
+motif_database <- "cisbp"
+
+motifs <- readRDS(file.path("../resource/tf_motifs/data_rds",
+                            paste0("motifs_pwmlist_mouse_", motif_database, ".rds")))
+
+motif_tfs <- unique(sapply(names(motifs), function(x){strsplit(x, split="_")[[1]][1]}))
+motif_tf_id_mapping <- list()
+for (x in names(motifs)){
+    temp_tf <- strsplit(x, split="_")[[1]][1]
+    motif_tf_id_mapping[[temp_tf]] <- c(motif_tf_id_mapping[[temp_tf]], x)
+}
+```
+
+```{r}
+# # Use motifs from JASPAR and add GATA2 from Cisbp
+# 
+# motifs_cisbp <- readRDS(file.path("../resource/tf_motifs/data_rds", 
+#                             paste0("motifs_pwmlist_mouse_", "cisbp", ".rds")))
+# 
+# motif_database <- "jaspar"
+# motifs <- readRDS(file.path("../resource/tf_motifs/data_rds", 
+#                             paste0("motifs_pwmlist_mouse_", motif_database, ".rds")))
+# 
+# motifs[["Gata2_M09121_2.00"]] <- motifs_cisbp$Gata2_M09121_2.00
+# 
+# motif_tfs <- unique(sapply(names(motifs), function(x){strsplit(x, split="_")[[1]][1]}))
+```
+
+# CREMA
+
+## CREMA regions
+
+```{r}
+# Select genes ===========
+exp_mtx <- GetAssayData(data_multi, assay = "RNA", slot = "counts")
+exp_mtx <- filter_exp_mtx_genes(exp_mtx)
+exp_mtx <- filter_exp_mtx_genes(exp_mtx, gene_names_remove_pattern = "^mt-", proportion_cells_detected = 1e-3)
+
+# Select TFs included in the model
+TFs.select <- intersect(motif_tfs, row.names(exp_mtx))
+print(paste("num of TFs selected:", length(TFs.select)))
+
+# Select genes as targets
+genes.select <- row.names(exp_mtx)
+genes.select <- intersect(genes.select, row.names(data_multi@assays$SCT@counts))
+print(length(genes.select))
+
+# Filter for genes with annotated TSS and not in chrM
+chromosomes <- c(paste0("chr", seq(1,19)), "chrX", "chrY")
+genes.annotated <- genebody.coords$symbol[as.character(seqnames(genebody.coords)) %in% chromosomes]
+genes.notfound <- genes.select[! genes.select %in% genes.annotated]
+genes.select <- genes.select[genes.select %in% genes.annotated]
+print(paste("num of genes selected:", length(genes.select)))
+
+
+# Data - RNA ==========
+exp_mtx <- GetAssayData(data_multi,
+                        assay = lm_data_use_rna$assay,
+                        slot = lm_data_use_rna$slot)[union(genes.select, TFs.select), ]
+exp_mtx <- as.matrix(exp_mtx)
+```
+
+```{r}
+DefaultAssay(data_multi) <- "SCT"
+data_multi <- FindVariableFeatures(data_multi, nfeatures = 4000)
+```
+
+```{r}
+# get the TSS of supplied genes
+# test_genes <- VariableFeatures(data_multi, assay = "SCT")
+test_genes <- union(genes.select, VariableFeatures(data_multi, assay = "SCT"))
+# test_genes <- genes.select
+print(length(test_genes))
+
+# No chrM genes
+test_genes <- genebody.coords[(genebody.coords$symbol %in% test_genes) & (seqnames(genebody.coords) != "chrMT")]$symbol
+
+# for (region_selection_method in c("all", "all_noncoding", "closest_noncoding")){
+#     crema_regions <- select_proximal_regions(genes = temp_genes, gene_region_inclusion = "all", self_region_inclusion = T)
+# }
+
+crema_regions <- select_proximal_regions(genes = test_genes, 
+                                         gene_body_gr = genebody.coords, 
+                                         window_up = 100000,
+                                         gene_region_inclusion = "all", 
+                                         self_region_inclusion = T)
+
+crema_regions_str <- lapply(crema_regions, Signac::GRangesToString)
+```
+
+## Run CREMA
+
+```{r}
+targets.select_preselect <- intersect(genes.select, names(crema_regions_str))
+batchSize <- 500
+
+for (site_extension in c(200)){
+    
+    output_dir <- file.path("../linear_model_results/", paste0("pituitary_wt-all-proximal", "-site", site_extension, "_", motif_database))
+    dir.create(file.path(output_dir), recursive = T, showWarnings = F)
+    dir.create(file.path(output_dir, "temp"), recursive = T, showWarnings = F)
+    
+    regression_method <- "ols"
+    
+    for (i in seq(1, ceiling(length(targets.select_preselect)/batchSize))){
+        
+        print(i)
+        temp_targets <- targets.select_preselect[(batchSize*(i-1)+1) : min(batchSize*i, length(targets.select_preselect))]
+        
+        lm.models_tf_ATACweighted_highres <- mclapply(temp_targets,
+                                                      function(x){ATAC_weighted_tf_model_highres(x,
+                                                                                                 TFs = TFs.select,
+                                                                                                 regions_str = crema_regions_str[[x]],
+                                                                                                 exp_mtx = exp_mtx,
+                                                                                                 motifs = motifs,
+                                                                                                 fragment_object = frag_object_inserts,
+                                                                                                 cells = colnames(data_multi),
+                                                                                                 genome = BSgenome.Mmusculus.UCSC.mm10,
+                                                                                                 return_val = "list",
+                                                                                                 regression_method = regression_method,
+                                                                                                 site_extension = site_extension)},
+                                                      mc.cores = 48)
+        names(lm.models_tf_ATACweighted_highres) <- temp_targets
+        
+        lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+        
+        saveRDS(lm.models_tf_ATACweighted_highres,
+                file.path(output_dir, "temp",
+                          paste0("crema-", regression_method, "-",lm_data_use_rna$assay, lm_data_use_rna$slot,
+                                 "_allTFs-allGenes-ATACweighted-highres_",
+                                 dataset_name, "_", i, ".rds")))
+    }
+    
+    lm.models_tf_ATACweighted_highres_all <- NULL
+    for (i in seq(1, ceiling(length(targets.select_preselect)/batchSize))){
+        
+        lm.models_tf_ATACweighted_highres <- readRDS(
+            file.path(output_dir, "temp",
+                      paste0("crema-", regression_method, "-",lm_data_use_rna$assay, lm_data_use_rna$slot,
+                             "_allTFs-allGenes-ATACweighted-highres_",
+                             dataset_name, "_", i, ".rds")))
+        
+        lm.models_tf_ATACweighted_highres_all <- c(lm.models_tf_ATACweighted_highres_all,
+                                                   lm.models_tf_ATACweighted_highres)
+    }
+    
+    saveRDS(lm.models_tf_ATACweighted_highres_all,
+            file.path(output_dir,
+                      paste0("crema-", regression_method, "-",lm_data_use_rna$assay, lm_data_use_rna$slot,
+                             "_allTFs-allGenes-ATACweighted-highres_",
+                             dataset_name, ".rds")))
+}
+```
+
+
+# TF KO Eval
+
+## Pseudo-bulk function
+
+```{r}
+pb_DE <- function(data_merge_subset, 
+                  genes_select, 
+                  assay = "RNA", 
+                  sample_name = "orig.ident", group_name = "condition", groups = c("WT", "KO"), 
+                  total_count_name = paste0("nCount_", assay),
+                  latent_vars = NULL,
+                  model = c("DESeq2", "lm", "glm"),
+                  norm_mtx_only = F){
+    
+    metadata_df <- data_merge_subset@meta.data
+    
+    counts_mtx <- data_merge_subset[[assay]]@counts
+    
+    sample_list <- split(x = colnames(counts_mtx), f = metadata_df[colnames(counts_mtx), sample_name])
+    
+    
+    # total counts
+    total_count <- sapply(sample_list, function(y){sum(metadata_df[y, total_count_name])}, USE.NAMES = T, simplify = T)
+    
+    # Pseudo-bulk mtx
+    sum_mtx <- do.call("cbind", lapply(sample_list, function(y){matrix(rowSums(counts_mtx[, y]), nrow = nrow(counts_mtx), ncol = 1)}))
+    row.names(sum_mtx) <- row.names(counts_mtx)
+    colnames(sum_mtx) <- names(sample_list)
+    
+    # normalized pseudo-bulk mtx
+    scale_factor <- total_count[1] / median(sum_mtx[,1])
+    norm_mtx <- t(t(sum_mtx) / total_count) * scale_factor
+    
+    if (norm_mtx_only){
+        return(norm_mtx)
+    }
+    
+    # total counts mtx
+    total_count <- matrix(total_count[colnames(norm_mtx)], nrow = ncol(norm_mtx))
+    
+    
+    # Run DE with the selected model
+    model <- match.arg(model)
+    
+    if (model == "DESeq2"){
+        
+        # DESeq -----
+        
+        # sample and group metadata
+        sample_meta_df <- metadata_df[, c(sample_name, group_name)]
+        sample_meta_df <- sample_meta_df[!duplicated(sample_meta_df), ]
+        colnames(sample_meta_df) <- c("sample", "group")
+        row.names(sample_meta_df) <- sample_meta_df$sample
+        
+        # DESeq dataset
+        dds <- DESeqDataSetFromMatrix(countData = sum_mtx,
+                                      colData = sample_meta_df,
+                                      design = ~ group)
+        
+        # Pre-filter
+        dds <- dds[rowSums(counts(dds)) >= 5, ]
+    
+        # Run DE
+        dds <- DESeq(dds)
+        
+        # Extract results (fold-change: B / A)
+        res <- results(dds, 
+                       contrast=c("group", groups[2], groups[1]),
+                       pAdjustMethod = "fdr")
+        resOrdered <- res[order(res$pvalue), ]
+        
+        # # LFC shrinkage
+        # resLFC <- lfcShrink(dds, coef=paste0("group_", groups[2], "_vs_", groups[1]), type="apeglm")
+        # resOrdered <- resLFC[order(resLFC$pvalue),]
+        
+        de_df <- as.data.frame(resOrdered)
+        colnames(de_df)[colnames(de_df) == "pvalue"] <- "p_val"
+        de_df$padj <- NULL
+        de_df$gene <- row.names(de_df)
+        de_df$avg_log2FC <- de_df$log2FoldChange
+    }
+    
+    if (model == "lm"){
+        
+        # group indicator matrix
+        sample_group_df <- metadata_df[colnames(counts_mtx), c(sample_name, group_name)]
+        sample_group_df <- sample_group_df[!duplicated(sample_group_df), ]
+        
+        sample_group <- (sample_group_df[, group_name] == groups[2]) + 0
+        names(sample_group) <- sample_group_df[, sample_name]
+        
+        sample_group <- matrix(sample_group[colnames(norm_mtx)], nrow = ncol(norm_mtx))
+        
+        # LM
+        de_lm <- sapply(row.names(norm_mtx), function(y){summary(lm(t(norm_mtx[y, , drop=F]) ~ sample_group))}, USE.NAMES = T, simplify = F)
+        de_df <- do.call("rbind", lapply(de_lm, function(y){as.data.frame(coef(y))["sample_group", , drop=F]}))
+        colnames(de_df)[colnames(de_df) == "Pr(>|t|)"] <- "p_val"
+        de_df$avg_log2FC <- de_df$`Estimate`
+        
+        de_df$gene <- names(de_lm)
+        row.names(de_df) <- de_df$gene
+    }
+    
+    de_df$p_val_adj <- p.adjust(de_df$p_val, method = "fdr")
+
+    return(de_df[de_df$gene %in% genes_select, , drop = F])
+}
+```
+
+
+## RNA
+
+```{r}
+TF_select <- "GATA2"
+data_merge <- readRDS(file.path("../data_seurat_object/pituitary_mutation/rna_merged/",
+                                paste0("MM", TF_select, "_merged_KO-WT.rds")))
+data_merge$SingleR.labels <- data_merge$maintype.ident
+data_merge$condition <- factor(data_merge$condition, levels = c("WT", "KO"))
+Idents(data_merge) <- data_merge$condition
+```
+
+```{r}
+celltypes_select <- c("Gonadotropes", "Somatotropes", "Lactotropes", "Melanotropes")
+
+data_merge_subset_list <- sapply(celltypes_select, 
+                                 function(x){subset(data_merge, cells = colnames(data_merge)[data_merge$maintype.ident %in% x])},
+                                 USE.NAMES = T, simplify = F)
+```
+
+### Pseudobulk
+
+```{r}
+pseudobulk_DE_genes_df_list <- mclapply(data_merge_subset_list, 
+                                        FUN = pb_DE, 
+                                        assay = "SCT", 
+                                        genes_select = names(crema_regions),
+                                        model = "DESeq2",
+                                        mc.cores = length(data_merge_subset_list))
+```
+
+
+## ATAC
+
+```{r}
+TF_select <- "GATA2"
+data_atac_merge <- readRDS(file.path("../data_seurat_object/pituitary_mutation/atac_merged/",
+                                paste0("MM", TF_select, "_merged_KO-WT.rds")))
+data_atac_merge$condition <- factor(data_atac_merge$condition, levels = c("WT", "KO"))
+Idents(data_atac_merge) <- data_atac_merge$condition
+
+# c("MMGATA2cKO-17", "MMGATA2cKO-3", "MMGATA2cKO-7", "MMGATA2Cont-2", "MMGATA2Cont-8", "MMGATA2Cont-9")
+frag_list <- list()
+for (i in seq(1, length(Fragments(data_atac_merge)))){
+    frag_list[[i]] <- CreateFragmentObject(path = gsub("fragments.tsv.gz", "atac_inserts.tsv.gz", Fragments(data_atac_merge)[[i]]@path, fixed = T),
+                                           cells = Fragments(data_atac_merge)[[i]]@cells)
+}
+```
+
+```{r}
+data_atac_merge_subset_list <- mclapply(list(Gonadotropes = c("Gonadotropes"), 
+                                             Somatotropes = c("Somatotropes", "Somatotropes 1", "Somatotropes 2", "Somatotropes 3"), 
+                                             Lactotropes = c("Lactotropes"), 
+                                             Melanotropes = c("Melanotropes")),
+                                        function(x){subset(data_atac_merge, cells = colnames(data_atac_merge)[data_atac_merge$cell.ident %in% x])})
+```
+
+## Sites
+
+```{r}
+# CREMA results =========
+site_extension <- 200
+regression_method <- "ols"
+
+smooth_k <- 0
+smooth_name <- ifelse(smooth_k == 0, yes = "", no = paste0("smooth-", smooth_k, "_"))
+
+output_dir <- file.path("../linear_model_results/", paste0("pituitary_wt-all-proximal", "-site", site_extension, "_", "jaspar"))
+
+lm.models_tf_ATACweighted_highres <- readRDS(file.path(output_dir,
+                                                       paste0("crema-", regression_method, "-", "SCTcounts",
+                                                              "_allTFs-allGenes-ATACweighted-highres_",
+                                                              smooth_name,
+                                                              dataset_name, ".rds")))
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[sapply(lm.models_tf_ATACweighted_highres, length) > 1]
+
+temp_p <- unlist(lapply(lm.models_tf_ATACweighted_highres, function(x){x$p[x$t > 0]}))
+p_val_cutoff <- max(temp_p[p.adjust(temp_p, method = "fdr") < 1e-3])
+print(p_val_cutoff)
+
+temp_func <- function(x){
+    temp_p <- lm.models_tf_ATACweighted_highres[[x]]$p
+    temp_t <- lm.models_tf_ATACweighted_highres[[x]]$t
+    temp_ind <- !is.na(temp_p) & temp_p < p_val_cutoff & !is.na(temp_t) & temp_t > 0
+    if(sum(temp_ind) > 0){
+        return(data.frame(gene = x,
+                          site = names(temp_p)[temp_ind],
+                          p_val = temp_p[temp_ind]))
+    }else{
+        return(data.frame())
+    }
+}
+crema_sites_select_df <- do.call("rbind", mclapply(names(lm.models_tf_ATACweighted_highres), temp_func, mc.cores = 40))
+print(nrow(crema_sites_select_df))
+
+temp <- strsplit(crema_sites_select_df$site, split = "_")
+crema_sites_select_df$TF <- sapply(temp, function(x){x[1]})
+crema_sites_select_df$site <- sapply(temp, function(x){x[2]})
+
+crema_sites_select_df <- data.table(crema_sites_select_df)
+```
+
+```{r}
+sites_select <- unique(crema_sites_select_df$site)
+print(length(sites_select))
+
+site_extension <- 200
+
+# sites_select_list <- list()
+# batchSize <- 5000
+# for (i in seq(1, ceiling(length(sites_select)/batchSize))){
+#     sites_select_list[[i]] <- sites_select[(batchSize*(i-1)+1) : min(batchSize*i, length(sites_select))]
+# }
+# sites_access_mtx_list <- mclapply(sites_select_list,
+#                                   function(x){FeatureMatrix(fragments = frag_list,
+#                                                             features = Extend(StringToGRanges(x), upstream = site_extension, downstream = site_extension, from.midpoint = T),
+#                                                             cells = colnames(data_atac_merge),
+#                                                             process_n = 20000,
+#                                                             verbose = F)},
+#                                   mc.cores = min(length(sites_select_list), 10))
+# sites_access_mtx <- do.call("rbind", sites_access_mtx_list)
+# row.names(sites_access_mtx) <- sites_select
+# saveRDS(sites_access_mtx, file.path("../application/pituitary_mutation/site_access_mtx.rds"))
+sites_access_mtx <- readRDS(file.path("../application/pituitary_mutation/site_access_mtx.rds"))
+
+# data_sites_merge <- CreateChromatinAssay(counts = sites_access_mtx,
+#                                         fragments = frag_list,
+#                                         annotation = data_atac_merge@assays$peaks_all@annotation)
+# data_sites_merge <- CreateSeuratObject(counts = data_sites_merge,
+#                                       assay = "sites",
+#                                       meta.data = data_atac_merge@meta.data)
+# data_sites_merge@reductions$umap <- data_atac_merge@reductions$umap
+# saveRDS(data_sites_merge, file.path("../application/pituitary_mutation/data_sites_seurat.rds"))
+data_sites_merge <- readRDS(file.path("../application/pituitary_mutation/data_sites_seurat.rds"))
+
+Idents(data_sites_merge) <- data_sites_merge$condition
+
+data_sites_merge_subset_list <- mclapply(list(Gonadotropes = c("Gonadotropes"),
+                                             Somatotropes = c("Somatotropes", "Somatotropes 1", "Somatotropes 2", "Somatotropes 3"),
+                                             Lactotropes = c("Lactotropes"),
+                                             Melanotropes = c("Melanotropes")),
+                                        function(x){subset(data_sites_merge, cells = colnames(data_sites_merge)[data_sites_merge$cell.ident %in% x])})
+```
+
+### Pseudobulk
+
+```{r}
+pseudobulk_DE_sites_df_list <- mclapply(data_sites_merge_subset_list,
+                                        FUN = pb_DE,
+                                        assay = "sites",
+                                        genes_select = row.names(data_sites_merge),
+                                        total_count_name = "passed_filters",
+                                        model = "DESeq2",
+                                        mc.cores = length(data_atac_merge_subset_list))
+print(sapply(pseudobulk_DE_sites_df_list, function(x){x["chr13-75028714-75028724", ]}))
+```
+
+
+# Gata2
+
+```{r}
+# CREMA results =========
+site_extension <- 200
+regression_method <- "ols"
+
+smooth_k <- 0
+smooth_name <- ifelse(smooth_k == 0, yes = "", no = paste0("smooth-", smooth_k, "_"))
+
+output_dir <- file.path("../linear_model_results/", paste0("pituitary_wt-all-proximal", "-site", site_extension, "_", motif_database))
+
+lm.models_tf_ATACweighted_highres <- readRDS(file.path(output_dir,
+                                                       paste0("crema-", regression_method, "-", "SCTcounts",
+                                                              "_allTFs-allGenes-ATACweighted-highres_",
+                                                              smooth_name,
+                                                              dataset_name, ".rds")))
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[!is.na(lm.models_tf_ATACweighted_highres)]
+lm.models_tf_ATACweighted_highres <- lm.models_tf_ATACweighted_highres[sapply(lm.models_tf_ATACweighted_highres, length) > 1]
+
+temp_p <- unlist(lapply(lm.models_tf_ATACweighted_highres, function(x){x$p[x$t > 0]}))
+p_val_cutoff <- max(temp_p[p.adjust(temp_p, method = "fdr") < 1e-4])
+print(p_val_cutoff)
+
+temp_func <- function(x){
+    temp_p <- lm.models_tf_ATACweighted_highres[[x]]$p
+    temp_t <- lm.models_tf_ATACweighted_highres[[x]]$t
+    temp_ind <- !is.na(temp_p) & temp_p < p_val_cutoff & !is.na(temp_t) & temp_t > 0
+    if(sum(temp_ind) > 0){
+        return(data.frame(gene = x,
+                          site = names(temp_p)[temp_ind],
+                          p_val = temp_p[temp_ind]))
+    }else{
+        return(data.frame())
+    }
+}
+crema_sites_select_df <- do.call("rbind", mclapply(names(lm.models_tf_ATACweighted_highres), temp_func, mc.cores = 40))
+print(nrow(crema_sites_select_df))
+
+temp <- strsplit(crema_sites_select_df$site, split = "_")
+crema_sites_select_df$TF <- sapply(temp, function(x){x[1]})
+crema_sites_select_df$site <- sapply(temp, function(x){x[2]})
+
+crema_sites_select_df <- data.table(crema_sites_select_df)
+```
+
+```{r}
+sites_select <- unique(crema_sites_select_df$site)
+print(length(sites_select))
+
+site_extension <- 200
+
+
+batchSize <- 40000
+for (i in seq(1, ceiling(length(sites_select)/batchSize))){
+
+    print(i)
+    
+    x <- sites_select[(batchSize*(i-1)+1) : min(batchSize*i, length(sites_select))]
+    temp <- FeatureMatrix(fragments = frag_list,
+                          features = Extend(StringToGRanges(x), upstream = site_extension, downstream = site_extension, from.midpoint = T),
+                          cells = colnames(data_atac_merge),
+                          process_n = 200000,
+                          verbose = F)
+    row.names(temp) <- x
+    saveRDS(temp, file.path("../temp/", paste0("site_access_mtx_", i, ".rds")))
+    
+}
+
+
+sites_access_mtx <- list()
+batchSize <- 40000
+for (i in seq(1, ceiling(length(sites_select)/batchSize))){
+    print(i)
+    sites_access_mtx[[i]] <- readRDS(file.path("../temp/", paste0("site_access_mtx_", i, ".rds")))
+}
+sites_access_mtx <- do.call("rbind", sites_access_mtx)
+
+saveRDS(sites_access_mtx, file.path("../temp/site_access_mtx.rds"))
+
+
+
+
+data_sites_merge <- CreateChromatinAssay(counts = sites_access_mtx,
+                                        fragments = frag_list,
+                                        annotation = data_atac_merge@assays$peaks_all@annotation)
+data_sites_merge <- CreateSeuratObject(counts = data_sites_merge,
+                                      assay = "sites",
+                                      meta.data = data_atac_merge@meta.data)
+data_sites_merge@reductions$umap <- data_atac_merge@reductions$umap
+Idents(data_sites_merge) <- data_sites_merge$condition
+
+
+
+data_sites_merge_subset_list <- mclapply(list(Gonadotropes = c("Gonadotropes"),
+                                             Somatotropes = c("Somatotropes", "Somatotropes 1", "Somatotropes 2", "Somatotropes 3"),
+                                             Lactotropes = c("Lactotropes"),
+                                             Melanotropes = c("Melanotropes")),
+                                        function(x){subset(data_sites_merge, cells = colnames(data_sites_merge)[data_sites_merge$cell.ident %in% x])})
+```
+
+```{r}
+pseudobulk_DE_sites_df_list <- mclapply(data_sites_merge_subset_list,
+                                        FUN = pb_DE,
+                                        assay = "sites",
+                                        genes_select = row.names(data_sites_merge),
+                                        total_count_name = "passed_filters",
+                                        model = "DESeq2",
+                                        mc.cores = length(data_atac_merge_subset_list))
+print(sapply(pseudobulk_DE_sites_df_list, function(x){x["chr13-75028714-75028724", ]}))
+```
+
+
+## All Gata2 circuits
+
+```{r}
+tf_select <- "Gata2"
+sites_select_df <-  crema_sites_select_df[crema_sites_select_df$TF == tf_select, ]
+
+print(length(unique(sites_select_df$site)))
+print(length(unique(sites_select_df$gene)))
+```
+
+```{r}
+# Filter for active circuits in each cell type =====
+celltypes_mapping <- list(Gonadotropes = c("Gonadotropes"),
+                          Somatotropes = c("Somatotropes 1", "Somatotropes 2"))
+
+temp_func <- function(celltype_select){
+    
+    # filter for active circuits in the selected cell type
+    cells_select <- colnames(data_multi)[data_multi$cell.ident.transferred %in% celltypes_mapping[[celltype_select]]]
+    
+    temp_genes <- unique(sites_select_df$gene)
+    temp_genes_mtx <- data_multi[["SCT"]]@counts[c(temp_genes, tf_select), cells_select, drop = F]
+    
+    
+    temp_genes_active <- rowMeans(temp_genes_mtx > 0)
+    temp_genes_active <- names(temp_genes_active)[temp_genes_active >= 0.30]
+    
+    temp_genes_active_byNum <- rowSums(temp_genes_mtx > 0)
+    temp_genes_active_byNum <- names(temp_genes_active_byNum)[temp_genes_active_byNum >= 259]
+    
+    
+    return(lapply(list(cells = cells_select,
+                       active_genes = temp_genes_active,
+                       active_genes_byNum = temp_genes_active_byNum),
+                  unique))
+}
+
+selected_active_circuits_list <- sapply(names(celltypes_mapping), temp_func, USE.NAMES = T, simplify = F)
+
+print(sapply(selected_active_circuits_list, function(x){sapply(x, length)}))
+```
+
+
+### All targets
+
+```{r}
+temp_num_df <- list()
+
+for (celltype_select in c("Gonadotropes", "Somatotropes")){
+    
+    targets_select_DE_df <- pseudobulk_DE_genes_df_list[[celltype_select]]
+    
+    temp_num_total_down_sig <- sum(targets_select_DE_df$p_val_adj < 0.05 &
+                                       targets_select_DE_df$log2FoldChange < 0, na.rm = T)
+    
+    targets_select_DE_df_select <- targets_select_DE_df[targets_select_DE_df$gene %in% selected_active_circuits_list[[celltype_select]]$active_genes_byNum, ]
+    targets_select_DE_df_select$p_val_adj <- p.adjust(targets_select_DE_df_select$p_val, method = "fdr")
+    targets_select_DE_df_select_sig <- targets_select_DE_df_select[targets_select_DE_df_select$p_val_adj < 0.05 & 
+                                                                       targets_select_DE_df_select$avg_log2FC < 0, ]
+    
+    hist(targets_select_DE_df_select$p_val, breaks = 30, 
+         main = paste(celltype_select, nrow(targets_select_DE_df_select_sig), "/", nrow(targets_select_DE_df_select)))
+    
+    
+    
+    temp_p <- phyper(q = nrow(targets_select_DE_df_select_sig),
+                     m = temp_num_total_down_sig,
+                     n = nrow(targets_select_DE_df) - temp_num_total_down_sig,
+                     k = nrow(targets_select_DE_df_select),
+                     lower.tail = F)
+    
+    temp_num_df[[celltype_select]] <- data.frame(celltype = celltype_select,
+                                                 num = nrow(targets_select_DE_df_select_sig),
+                                                 num_total = nrow(targets_select_DE_df_select),
+                                                 num_de = temp_num_total_down_sig,
+                                                 num_total_tested = nrow(targets_select_DE_df), 
+                                                 p_val = temp_p)
+}
+temp_num_df <- do.call("rbind", temp_num_df)
+print(temp_num_df)
+```
+
+
+### All sites
+
+```{r}
+# sites_select <- unique(crema_sites_select_df$site[crema_sites_select_df$TF == tf_select])
+# print(length(sites_select))
+# 
+# site_extension <- 200
+# 
+# sites_access_mtx <- FeatureMatrix(fragments = frag_list,
+#                                   features = Extend(StringToGRanges(sites_select), upstream = site_extension, downstream = site_extension, from.midpoint = T),
+#                                   cells = colnames(data_atac_merge),
+#                                   process_n = 2000000,
+#                                   verbose = F)
+# row.names(sites_access_mtx) <- sites_select
+# 
+# 
+# data_sites_merge <- CreateChromatinAssay(counts = sites_access_mtx,
+#                                         fragments = frag_list,
+#                                         annotation = data_atac_merge@assays$peaks_all@annotation)
+# data_sites_merge <- CreateSeuratObject(counts = data_sites_merge,
+#                                       assay = "sites",
+#                                       meta.data = data_atac_merge@meta.data)
+# data_sites_merge@reductions$umap <- data_atac_merge@reductions$umap
+# 
+# Idents(data_sites_merge) <- data_sites_merge$condition
+# 
+# data_sites_merge_subset_list <- mclapply(list(Gonadotropes = c("Gonadotropes"), 
+#                                              Somatotropes = c("Somatotropes", "Somatotropes 1", "Somatotropes 2", "Somatotropes 3"), 
+#                                              Lactotropes = c("Lactotropes"), 
+#                                              Melanotropes = c("Melanotropes")),
+#                                         function(x){subset(data_sites_merge, cells = colnames(data_sites_merge)[data_sites_merge$cell.ident %in% x])})
+```
+
+
+## Pcsk1
+
+```{r}
+target_select <- "Pcsk1"
+print(crema_sites_select_df[crema_sites_select_df$TF == tf_select & crema_sites_select_df$gene == target_select, ])
+
+site_select <- "chr13-75028714-75028724"
+```
+
+### WT
+
+```{r}
+out_dir <- file.path("../application/pituitary_wt/", paste0("Examples_", tf_select, "-", target_select))
+dir.create(out_dir, showWarnings = F, recursive = T)
+
+fig_print <- T
+fig_save <- F
+
+temp_tf <- "Gata2"
+temp_target <- target_select
+temp_site <- site_select
+
+# Scatter plot -----
+p1 <- FeaturePlot(data_multi, features = c(temp_target, temp_tf), reduction = "umap", pt.size = 0.1)
+print(p1)
+
+
+# Coverage plot -----
+
+temp_site_gr <- Extend(StringToGRanges(temp_site), upstream = 50, downstream = 50, from.midpoint = T)
+
+# plot_gr <- genebody.coords[(genebody.coords$symbol == temp_target)][1]
+plot_gr <- GRanges(seqnames = seqnames(crema_regions[[temp_target]][1]),
+                   ranges = IRanges(start = crema_regions[[temp_target]][1]$TSS, end = crema_regions[[temp_target]][1]$TSS+1))
+plot_gr <- GRanges(seqnames = seqnames(plot_gr),
+                   ranges = IRanges(start = min(start(plot_gr), start(temp_site_gr)),
+                                    end = max(end(plot_gr), end(temp_site_gr))))
+plot_gr <- Extend(plot_gr, upstream = 5000, downstream = 5000)
+
+# temp_site_gr <- Extend(StringToGRanges(temp_site), upstream = 50, downstream = 50, from.midpoint = T)
+
+# Separate by target gene expression
+data_multi$temp_ident <- ifelse(data_multi@assays$SCT@counts[target_select, colnames(data_multi)] > 0,
+                                yes = "high", no = "low")
+covplot <- CoveragePlot(data_multi, 
+                        assay = "ATAC",
+                        region = plot_gr,
+                        group.by = "temp_ident",
+                        annotation = T, peaks = T,
+                        ranges = temp_site_gr, ranges.title = temp_tf, 
+                        features = c(temp_target, temp_tf))
+if (fig_print){ print(covplot) }
+if (fig_save){
+    ggsave(file.path(out_dir,
+                     paste0("covplot-groupExp_", temp_tf, "-", temp_target, "-", temp_site, ".pdf")),
+           covplot, width = 6, height = 6)
+}
+
+
+
+
+# Zoomed coverage plot ----------
+
+plot_gr <- Extend(StringToGRanges(site_select), upstream = 700, downstream = 1200)
+
+data_multi$temp_ident <- ifelse(data_multi@assays$SCT@counts[target_select, colnames(data_multi)] > 0,
+                                yes = "high", no = "low")
+covplot <- CoveragePlot(data_multi, 
+                        assay = "ATAC",
+                        region = plot_gr,
+                        group.by = "temp_ident",
+                        annotation = F, peaks = F)
+if (fig_print){ print(covplot) }
+if (fig_save){
+    ggsave(file.path(out_dir,
+                     paste0("covplot-groupExp_", temp_tf, "-", temp_target, "-", temp_site, "_zoom.pdf")),
+           covplot, width = 6, height = 6)
+}
+```
+
+
+### RNA in KO
+
+```{r}
+# Plot the RNA DE of the selected target gene
+# Both single cell DE and pseudo-bulk DE
+
+tf_select <- "Gata2"
+temp_target <- "Pcsk1"
+
+target_pbde_celltype_rna_df <- list()
+
+for (celltypes_select in c("Gonadotropes", "Somatotropes", "Lactotropes", "Melanotropes")){
+    
+    # pseudobulk DE
+    temp_df <- pseudobulk_DE_genes_df_list[[celltypes_select]]
+    temp_df$gene <- row.names(temp_df)
+    temp_df$celltype <- celltypes_select
+    temp_df <- temp_df[temp_target, , drop = F]
+    
+    target_pbde_celltype_rna_df[[celltypes_select]] <- temp_df
+}
+
+target_pbde_celltype_rna_df <- do.call("rbind", target_pbde_celltype_rna_df)
+
+print(target_pbde_celltype_rna_df)
+```
+
+```{r}
+# Plot of Pseudobulk DE
+
+target_pbde_mtx <- list()
+for (celltypes_select in c("Gonadotropes", "Somatotropes", "Lactotropes", "Melanotropes")){
+    
+    temp_df <- pb_DE(data_merge_subset_list[[celltypes_select]], genes_select = c(temp_target, tf_select), assay = "RNA", norm_mtx_only = T)
+    temp_df <- as.data.frame(temp_df[temp_target, , drop = F])
+    
+    temp_df$gene <- row.names(temp_df)
+    temp_df$celltype <- celltypes_select
+    target_pbde_mtx[[celltypes_select]] <- temp_df
+}
+target_pbde_mtx <- do.call("rbind", target_pbde_mtx)
+
+target_pbde_mtx <- reshape2::melt(target_pbde_mtx, 
+                                  id.vars = c("gene", "celltype"), 
+                                  variable.name = "sample", value.name = "pseudo_bulk_expression")
+temp_sample_group <- data_merge@meta.data[, c("orig.ident", "condition")]
+temp_sample_group <- temp_sample_group[!duplicated(temp_sample_group), ]
+target_pbde_mtx <- merge(target_pbde_mtx, temp_sample_group, by.x = "sample", by.y = "orig.ident", all.x = T)
+
+ggplot(target_pbde_mtx) + 
+    geom_boxplot(aes(x = celltype, y = pseudo_bulk_expression, fill = condition)) +
+    scale_fill_manual(values = c("#468499", "#EEAA88")) + 
+    ylab("Pseudo-bulk expression") + 
+    ggtitle(paste(temp_target, "pseudo-bulk expression")) + 
+    theme_minimal() + 
+    theme(axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 16),
+          legend.title = element_text(size = 16), legend.text = element_text(size = 16))
+    
+
+ggplot(target_pbde_mtx) + 
+    geom_point(aes(x = celltype, y = pseudo_bulk_expression, color = condition), position = position_jitterdodge(), size = 3) + 
+    scale_color_manual(values = c("#468499", "#EEAA88")) + 
+    ylab("Pseudo-bulk expression") + 
+    ggtitle(paste(temp_target, "pseudo-bulk expression")) + 
+    theme_minimal() + 
+    theme(axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 16),
+          legend.title = element_text(size = 16), legend.text = element_text(size = 16))
+```
+
+
+### ATAC in KO
+
+```{r}
+temp_target <- "Pcsk1"
+temp_site <- "chr13-75028714-75028724"
+
+target_pbde_celltype_atac_df <- list()
+
+for (celltypes_select in names(data_atac_merge_subset_list)){
+    
+    # pseudobulk DE
+    temp_df <- pseudobulk_DE_sites_df_list[[celltypes_select]]
+    temp_df$gene <- row.names(temp_df)
+    temp_df$celltype <- celltypes_select
+    temp_df <- temp_df[temp_site, , drop = F]
+
+    target_pbde_celltype_atac_df[[celltypes_select]] <- temp_df
+}
+
+target_pbde_celltype_atac_df <- do.call("rbind", target_pbde_celltype_atac_df)
+
+print(target_pbde_celltype_atac_df)
+```
+
+```{r}
+# Plot of Pseudobulk DE
+
+target_pbde_mtx <- list()
+for (celltypes_select in c("Gonadotropes", "Somatotropes", "Lactotropes", "Melanotropes")){
+    
+    temp_df <- pb_DE(data_sites_merge_subset_list[[celltypes_select]], genes_select = temp_site, assay = "sites", total_count_name = "passed_filters", norm_mtx_only = T)
+    temp_df <- as.data.frame(temp_df[temp_site, , drop = F])
+    
+    temp_df$gene <- row.names(temp_df)
+    temp_df$celltype <- celltypes_select
+    target_pbde_mtx[[celltypes_select]] <- temp_df
+}
+target_pbde_mtx <- do.call("rbind", target_pbde_mtx)
+
+target_pbde_mtx <- reshape2::melt(target_pbde_mtx, 
+                                  id.vars = c("gene", "celltype"), 
+                                  variable.name = "sample", value.name = "pseudo_bulk_accessibility")
+temp_sample_group <- data_atac_merge@meta.data[, c("orig.ident", "condition")]
+temp_sample_group <- temp_sample_group[!duplicated(temp_sample_group), ]
+target_pbde_mtx <- merge(target_pbde_mtx, temp_sample_group, by.x = "sample", by.y = "orig.ident", all.x = T)
+
+ggplot(target_pbde_mtx) + 
+    geom_boxplot(aes(x = celltype, y = pseudo_bulk_accessibility, fill = condition)) +
+    scale_fill_manual(values = c("#468499", "#EEAA88")) + 
+    ylab("Pseudo-bulk accessibility") + 
+    ggtitle(paste(tf_select, temp_target, "regulatory domain pseudo-bulk accessibility")) + 
+    theme_minimal() + 
+    theme(axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 16))
+    
+
+ggplot(target_pbde_mtx) + 
+    geom_point(aes(x = celltype, y = pseudo_bulk_accessibility, color = condition), position = position_jitterdodge(), size = 3) + 
+    scale_color_manual(values = c("#468499", "#EEAA88")) + 
+    ylab("Pseudo-bulk accessibility") + 
+    ggtitle(paste(tf_select, temp_target, "regulatory domain pseudo-bulk accessibility")) + 
+    theme_minimal() + 
+    theme(axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 16))
+```
+
+# Peaks recall
+
+```{r}
+Fragments(data_multi[["ATAC"]]) <- NULL
+Fragments(data_multi[["ATAC"]]) <- frag_object_fragments
+
+peaks_called_q_list <- list()
+
+for (peak_q_cutoff in c(0.05, 0.08, 0.1, 0.2, 0.3, 0.5, 0.8, 0.9, 0.95)){
+    print(peak_q_cutoff)
+    peaks_called_q_list[[as.character(peak_q_cutoff)]] <- CallPeaks(data_multi, 
+                                                                    assay = "ATAC", 
+                                                                    effective.genome.size = 1.87e9,
+                                                                    macs2.path="/home/zidongz/anaconda3/envs/macs/bin/macs2",
+                                                                    additional.args = paste0("-q ", peak_q_cutoff))
+}
+
+saveRDS(peaks_called_q_list, file.path("../data_seurat_object/pituitary_wt", paste0("MM-", sample_id, "_peaks_called_q_list.rds")))
+```
+
+```{r}
+peaks_called_q_list <- readRDS(file.path("../data_seurat_object/pituitary_wt", paste0("MM-", sample_id, "_peaks_called_q_list.rds")))
+
+for (peak_q_cutoff in c(0.9)){
+    print(peak_q_cutoff)
+    peaks_called_q_list[[as.character(peak_q_cutoff)]] <- CallPeaks(data_multi, 
+                                                                    assay = "ATAC", 
+                                                                    effective.genome.size = 1.87e9,
+                                                                    macs2.path="/home/zidongz/anaconda3/envs/macs/bin/macs2",
+                                                                    additional.args = paste0("-q ", peak_q_cutoff))
+}
+
+sapply(peaks_called_q_list, length)
+```
+
+```{r}
+for (x in names(peaks_called_q_list)){
+    print(paste(x, overlapsAny(StringToGRanges("chr13-75028714-75028724"), peaks_called_q_list[[x]])))
+}
+```
+
+
+# Exon 5 in KO
+
+## Subset snRNA to gonadotorpes
+
+## RNA
+
+```{r}
+# RNA
+data_dir <- "../data/pituitary_mutation_princeton/rna/Gata2KO_Study/"
+datasets <- list.files(data_dir)
+datasets <- gsub(".rds", "", datasets, fixed = T)
+
+data_mut_rna_list <- list()
+for (dataset in datasets){
+    data_rna <- readRDS(file.path(data_dir, paste0(dataset, ".rds")))
+    
+    data_rna$orig.ident <- dataset
+    data_rna$sex <- ifelse(grepl("^MM", dataset), yes = "Male", no = "Female")
+    data_rna$condition <- ifelse(grepl("KO", dataset), yes = "KO", no = "WT")
+    
+    data_mut_rna_list[[dataset]] <- data_rna
+}
+```
+
+```{r}
+print(lapply(data_mut_rna_list, function(x){table(x$maintype.ident)}))
+```
+
+```{r}
+# Gonodotropes barcodes
+
+for (celltype_select in c("Gonadotropes", "Somatotropes")){
+    
+    output_dir <- file.path("../data/pituitary_mutation/RNA/data_bam-subset_celltype/", celltype_select)
+    dir.create(output_dir, recursive = T, showWarnings = F)
+    
+    for (dataset in names(data_mut_rna_list)){
+        
+        data_rna <- data_mut_rna_list[[dataset]]
+        
+        dataset <- gsub("cKO", "cKO-", dataset)
+        dataset <- gsub("Cont", "Cont-", dataset)
+        
+        # Save barcodes
+        cells_select <- colnames(data_rna)[data_rna$maintype.ident == celltype_select]
+        print(length(cells_select))
+        
+        write.table(data.frame(cell = cells_select),
+                    file.path(output_dir, paste0(dataset, "_", celltype_select, "_barcodes.tsv")),
+                    sep = "\t", row.names = F, col.names = F, quote = F)
+    }
+}
+```
+
+```{r}
+
+```
+
+## Gata2 exon reads
+
+```{r}
+data_dir <- "../data/pituitary_mutation_princeton/rna/Gata2KO_Study/"
+datasets <- list.files(data_dir)
+datasets <- gsub(".rds", "", datasets, fixed = T)
+
+datasets <- gsub("cKO", "cKO-", datasets)
+datasets <- gsub("Cont", "Cont-", datasets)
+
+data_reads_list <- list()
+
+for (celltype_select in c("Gonadotropes", "Somatotropes")){
+    
+    for (dataset in datasets){
+        
+        temp <- readLines(file.path("../data/pituitary_mutation/RNA/data_bam-subset_celltype-Gata2Region-exon5/",
+                                    paste0(dataset, "_", celltype_select, "_subset-bam.bam")))
+        temp <- lapply(strsplit(temp, split = "\t"), function(x){x[1:10]})
+        
+        if (length(temp) == 0){
+            # temp_df <- data.frame(celltype = celltype_select,
+            #                   dataset = dataset,
+            #                   chr = NA,
+            #                   start = NA,
+            #                   cigar_op = NA)
+            temp_df <- data.frame()
+        }else{
+            temp_df <- data.frame(celltype = celltype_select,
+                                  dataset = dataset,
+                                  chr = sapply(temp, function(x){x[3]}),
+                                  start = as.numeric(sapply(temp, function(x){x[4]})),
+                                  cigar_op = sapply(temp, function(x){x[6]}))
+        }
+        
+        data_reads_list[[paste0(celltype_select, "_", dataset)]] <- temp_df
+        
+    }
+}
+
+data_reads_df <- do.call("rbind", data_reads_list)
+
+data_reads_df$dataset <- factor(data_reads_df$dataset, levels = datasets)
+row.names(data_reads_df) <- seq(1, nrow(data_reads_df))
+
+print(table(data_reads_df$celltype, data_reads_df$dataset))
+```
+
+```{r}
+library(stringr)
+
+all_cigar_op <- data_reads_df$cigar_op
+all_cigar_op <- gsub("^[0-9]+S", "", all_cigar_op)
+
+temp_func <- function(i){
+    temp_celltype <- data_reads_df[i, "celltype"]
+    temp_dataset <- data_reads_df[i, "dataset"]
+    temp_chr <- data_reads_df[i, "chr"]
+    temp_start <- data_reads_df[i, "start"]
+    temp_cigar_op <- all_cigar_op[i]
+    
+    op_1 <- str_extract(temp_cigar_op, "^[0-9]+M")
+    temp_end <- temp_start + as.numeric(gsub("M", "", op_1))
+    temp_cigar_op <- gsub("^[0-9]+M", "", temp_cigar_op)
+    
+    temp_cigar_op <- gsub("^[0-9]+S", "", temp_cigar_op)
+    
+    # if no skip read
+    if(nchar(temp_cigar_op) == 0){
+        return(data.frame(celltype = temp_celltype,
+                          dataset = temp_dataset,
+                          chr = temp_chr,
+                          start = temp_start,
+                          end = temp_end))
+    }
+    
+    # if skip read
+    op_splice <- str_extract(temp_cigar_op, "^[0-9]+N")
+    temp_start_2 <- temp_end + as.numeric(gsub("N", "", op_splice))
+    temp_cigar_op <- gsub("^[0-9]+N", "", temp_cigar_op)
+    
+    op_2 <- str_extract(temp_cigar_op, "^[0-9]+M")
+    temp_end_2 <- temp_start_2 + as.numeric(gsub("M", "", op_2))
+    temp_cigar_op <- gsub("^[0-9]+M", "", temp_cigar_op)
+    
+    return(data.frame(celltype = temp_celltype,
+                      dataset = temp_dataset,
+                      chr = temp_chr,
+                      start = c(temp_start, temp_start_2),
+                      end = c(temp_end, temp_end_2)))
+}
+
+data_reads_ends_df <- do.call("rbind", lapply(seq(1, nrow(data_reads_df)), temp_func))
+```
+
+```{r}
+data_reads_ends_gr <- GRanges(seqnames = data_reads_ends_df$chr,
+                              ranges = IRanges(start = data_reads_ends_df$start,
+                                               end = data_reads_ends_df$end))
+
+data_reads_ends_df <- data_reads_ends_df[overlapsAny(data_reads_ends_gr, StringToGRanges("chr6-88204583-88204708")), ]
+
+data_reads_ends_df <- data.table(data_reads_ends_df)
+data_reads_ends_df$dataset <- factor(data_reads_ends_df$dataset, levels = datasets)
+
+print(table(data_reads_ends_df$celltype, data_reads_ends_df$dataset))
+```
+
+```{r}
+setkey(data_reads_ends_df, dataset, celltype)
+data_reads_exon_num_df <- data_reads_ends_df[CJ(dataset, celltype, unique = T), .(Number = .N), by = .EACHI]
+```
+
+```{r}
+data_reads_exon_num_df$Condition <- ifelse(grepl("cKO", data_reads_exon_num_df$dataset),
+                                           yes = "Gonadotrope Gata2 KO", no = "Wild type")
+
+ggplot(data_reads_exon_num_df) + 
+    geom_point(aes(x = Condition, y = Number), size = 2, position = position_jitter(width = 0.1, height = 0)) + 
+    xlab("Condition") + ylab("# reads mapped to Gata2 exon 5") + 
+    facet_wrap("celltype", scales = "fixed") + 
+    theme_minimal() +
+    theme(axis.title.x = element_text(size = 0), axis.text.x = element_text(size = 12, angle = 45, hjust = 1, vjust = 1),
+          axis.title.y = element_text(size = 12),
+          strip.text = element_text(size = 12))
+```

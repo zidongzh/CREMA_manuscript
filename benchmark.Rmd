@@ -769,12 +769,22 @@ tripod_gene_tf_peak_df_all <- tripod_df[, list(p_val = min(pval)), by = list(gen
 ```
 
 ```{r}
+targets_intersect <- intersect(crema_gene_tf_site_reduced_df$gene, tripod_df$gene)
+    
+data_multi_subsetgene <- CreateSeuratObject(counts = exp_mtx[targets_intersect, ])
+
+# limit to variable genes
+data_multi_subsetgene <- FindVariableFeatures(data_multi_subsetgene, assay = "RNA", nfeatures = 1000, verbose = F)
+genes_test <- VariableFeatures(data_multi_subsetgene)
+```
+
+```{r}
 temp_numm_df <- data.frame(method = c("CREMA", "Tripod"),
                            row.names = c("CREMA", "Tripod"))
 
 fdr_cutoff <- 5e-3
 
-genes_intersect <- intersect(crema_gene_tf_site_reduced_df$gene, tripod_gene_tf_peak_df_all$gene)
+genes_intersect <- genes_test
 
 
 temp_numm_df["CREMA", "peaks"] <- sum(p.adjust(crema_gene_tf_site_reduced_df$p_val, method = "fdr") < fdr_cutoff & 
@@ -1012,7 +1022,9 @@ saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tri
 # saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_overlappedTrueRegions_site50_reduce.rds")
 
 # saveRDS(eval_results_list, "../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_overlappedTrueRegions_site50.rds")
+```
 
+```{r}
 eval_results_list <- readRDS("../eval_regions/10X_pbmc/eval_results_list_CREMA-Tripod_overlappedTrueRegions_site50_reduce.rds")
 
 
@@ -1020,7 +1032,7 @@ eval_databases_list <- c(enhancer_db_list, gtex_db_list[2:4])
 
 
 # Calculate precision and recall at different FDR cutoffs
-for (eval_db_name in names(eval_databases_list)){
+for (eval_db_name in names(eval_databases_list)[c(3,6)]){
     
     # evaluation gene-site dataset
     print(eval_db_name)
@@ -1046,7 +1058,7 @@ for (eval_db_name in names(eval_databases_list)){
     print(nrow(eval_db_totalNum_df))
     
     # Select a few cutoffs for comparing precision and recall ==========
-    fdr_cutoffs <- 1*10^(seq(-1, -5, length.out = 30))
+    fdr_cutoffs <- 1*10^(seq(-1, -5, length.out = 20))
     
     
     # Get the precision and recall at each cutoff ==========
@@ -1160,7 +1172,7 @@ temp_func <- function(x){
     temp_df <- temp_df[temp_df$precision >= precision_min & temp_df$precision <= precision_max, ]
     return(temp_df)
 }
-temp_pr_df <- do.call("rbind", lapply(eval_results_list, temp_func))
+temp_pr_df <- do.call("rbind", lapply(eval_results_list[c(3,6)], temp_func))
 
 ggplot(temp_pr_df) + 
     geom_line(aes(x = precision, y = recall, color = method), size = 2) + 

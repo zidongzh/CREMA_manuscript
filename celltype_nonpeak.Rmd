@@ -32,6 +32,10 @@ frag_object_human_inserts <- CreateFragmentObject(path = file.path("../data/10X_
                                             cells = colnames(data_human))
 ```
 
+```{r}
+DimPlot(data_human, reduction = "umap")
+```
+
 ## CREMA results
 
 ```{r}
@@ -88,7 +92,8 @@ min_overlap_for_peak <- 0
 sites_all_str <- unique(crema_sites_select_df$site)
 sites_all_gr <- StringToGRanges(sites_all_str)
 
-peaks_all_gr <- data_human[["ATAC"]]@ranges
+# peaks_all_gr <- data_human[["ATAC"]]@ranges
+peaks_all_gr <- data_human[["peaks"]]@ranges
 peaks_all_str <- GRangesToString(peaks_all_gr)
 
 temp_overlap <- findOverlaps(sites_all_gr, peaks_all_gr, minoverlap = min_overlap_for_peak)
@@ -222,7 +227,8 @@ data_human_nonpeak <- RunSVD(data_human_nonpeak, verbose = F)
 data_human_nonpeak <- RunUMAP(data_human_nonpeak, reduction = "lsi", dims = 2:30, reduction.name = "umap", reduction.key = "sitesUMAP_", verbose = F)
 
 
-p1 <- DimPlot(data_human_nonpeak, reduction = "umap", group.by = "celltype_annotation_coarse", label = T, repel = T) + NoLegend() + ggtitle("UMAP by sites out of peaks")
+p1 <- DimPlot(data_human_nonpeak, reduction = "umap", group.by = "celltype_annotation_coarse", label = T, repel = T) + NoLegend() + ggtitle("UMAP by sites out of peaks") + 
+    xlab("UMAP_1") + ylab("UMAP_2")
 print(p1)
 
 ggsave(file.path("../application/10X_pbmc/UMAP_sites-nonpeak.png"), p1, width = 6, height = 5)
@@ -306,7 +312,8 @@ min_overlap_for_peak <- 0
 sites_all_str <- unique(crema_sites_select_df$site)
 sites_all_gr <- StringToGRanges(sites_all_str)
 
-peaks_all_gr <- data_mouse[["ATAC"]]@ranges
+# peaks_all_gr <- data_mouse[["ATAC"]]@ranges
+peaks_all_gr <- data_mouse[["peaks"]]@ranges
 peaks_all_str <- GRangesToString(peaks_all_gr)
 
 temp_overlap <- findOverlaps(sites_all_gr, peaks_all_gr, minoverlap = min_overlap_for_peak)
@@ -412,7 +419,7 @@ data_mouse_nonpeak <- RunUMAP(data_mouse_nonpeak, reduction = "lsi", reduction.n
 
 p1 <- DimPlot(data_mouse_nonpeak, reduction = "umap", group.by = "celltype_annotation", label = T, repel = T) + NoLegend() + ggtitle("UMAP using CREMA sites")
 print(p1)
-ggsave(file.path("../application/pituitary_wt//UMAP_sites-nonpeak.png"), p1, width = 6, height = 5)
+ggsave(file.path("../application/pituitary_wt/UMAP_sites-nonpeak.png"), p1, width = 6, height = 5)
 ```
 
 
