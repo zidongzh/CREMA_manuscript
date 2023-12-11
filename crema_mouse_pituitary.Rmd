@@ -609,7 +609,7 @@ sites_access_mtx <- do.call("rbind", sites_access_mtx)
 
 saveRDS(sites_access_mtx, file.path("../temp/site_access_mtx.rds"))
 
-
+sites_access_mtx <- readRDS("../temp/site_access_mtx.rds")
 
 
 data_sites_merge <- CreateChromatinAssay(counts = sites_access_mtx,
@@ -962,13 +962,16 @@ target_pbde_mtx <- merge(target_pbde_mtx, temp_sample_group, by.x = "sample", by
 
 ggplot(target_pbde_mtx) + 
     geom_boxplot(aes(x = celltype, y = pseudo_bulk_accessibility, fill = condition)) +
-    scale_fill_manual(values = c("#468499", "#EEAA88")) + 
+    geom_point(aes(x = celltype, y = pseudo_bulk_accessibility, fill = condition), position = position_jitterdodge(), size = 3) + 
+    scale_fill_manual(values = c("#468499", "#EEAA88"), labels = c("WT", "Gonadotrope KO")) + 
     ylab("Pseudo-bulk accessibility") + 
     ggtitle(paste(tf_select, temp_target, "regulatory domain pseudo-bulk accessibility")) + 
     theme_minimal() + 
     theme(axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
           axis.title.x = element_blank(),
-          axis.title.y = element_text(size = 16))
+          axis.title.y = element_text(size = 16),
+          legend.text = element_text(size = 16),
+          legend.title = element_text(size = 16))
     
 
 ggplot(target_pbde_mtx) + 
@@ -979,7 +982,8 @@ ggplot(target_pbde_mtx) +
     theme_minimal() + 
     theme(axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
           axis.title.x = element_blank(),
-          axis.title.y = element_text(size = 16))
+          axis.title.y = element_text(size = 16),
+          legend.text = element_text(size = 16))
 ```
 
 # Peaks recall
